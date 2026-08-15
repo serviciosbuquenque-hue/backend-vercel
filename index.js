@@ -111,11 +111,6 @@ function paginateArray(array, req) {
 const app = express();
 exports.app = app;
 
-// NOTA DE SEGURIDAD: el `express.static('public')` que antes iba aquí se
-// movió más abajo, después del middleware de autenticación (buscar
-// "GATE DE AUTENTICACIÓN"), para que el panel (index.html/scripts.js) no
-// se pueda servir a nadie que no haya iniciado sesión.
-
 // Configuración de CORS
 const allowedOrigins = [
     "https://www.buquenqe.com",
@@ -875,9 +870,6 @@ app.use(cors({
     },
     methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
-    // Imprescindible para que el navegador envíe/reciba la cookie de sesión
-    // en peticiones cross-origin (tu panel de analíticas vive en GitHub
-    // Pages, un dominio distinto al del backend en Render).
     credentials: true
 }));
 
@@ -924,12 +916,6 @@ app.use(session({
     saveUninitialized: false,
     cookie: {
         httpOnly: true,
-        // `sameSite: 'none'` + `secure: true` es OBLIGATORIO para que la
-        // cookie de sesión viaje en peticiones cross-site (fetch desde
-        // GitHub Pages hacia Render). Con 'lax' el navegador la descarta
-        // en cualquier fetch que no sea una navegación de nivel superior.
-        // Ambos dominios ya sirven por HTTPS, así que no hay problema con
-        // `secure: true` en producción.
         secure: true,
         sameSite: 'none',
         maxAge: 1000 * 60 * 60 * 12 // 12 horas
