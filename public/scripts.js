@@ -336,14 +336,7 @@ window.addEventListener('load', initDashboard);
 
 // Asegurar que los eventos se agreguen después de que el DOM esté completamente cargado
 document.addEventListener('DOMContentLoaded', () => {
-    const newOrdersButton = document.getElementById('new-orders-button');
     const closeOrdersPanel = document.getElementById('close-orders-panel');
-
-    if (newOrdersButton) {
-        newOrdersButton.addEventListener('click', showNewOrdersPanel);
-    } else {
-        console.error('Elemento con ID "new-orders-button" no encontrado.');
-    }
 
     if (closeOrdersPanel) {
         closeOrdersPanel.addEventListener('click', closeNewOrdersPanel);
@@ -364,7 +357,6 @@ document.addEventListener('DOMContentLoaded', () => {
 
 // Call the function to find new orders when the page loads
 window.onload = () => {
-    findNewOrders();
     loadFcmTokens();
 };
 
@@ -426,10 +418,6 @@ async function handleClearStatistics() {
             // Limpiar el contenido del panel de pedidos
             const ordersList = document.getElementById('orders-list');
             ordersList.textContent = '';
-
-            // Ocultar el botón de pedidos
-            const newOrdersButton = document.getElementById('new-orders-button');
-            newOrdersButton.classList.add('hidden');
 
             // Ocultar el panel si está activo
             const panel = document.getElementById('new-orders-panel');
@@ -530,19 +518,6 @@ async function subscribeFcmToken() {
         showNotificationPanel(`Error suscribiendo token: ${error.message}`, 'error');
     }
 }
-
-// Unificar manejo de visibilidad del botón de pedidos
-function updateNewOrdersButtonVisibility() {
-    const button = document.getElementById('new-orders-button');
-    if (newOrders.length > 0) {
-        button.style.display = 'block';
-    } else {
-        button.style.display = 'none';
-    }
-}
-
-// Llamar esta función después de actualizar pedidos
-updateNewOrdersButtonVisibility();
 
 // Actualizar el saludo para incluir la hora actual
 function updateGreetingAndBackground() {
