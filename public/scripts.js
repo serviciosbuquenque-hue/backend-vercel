@@ -1,3 +1,20 @@
+(function () {
+    const TOKEN_KEY = 'buquenque_auth_token';
+    const originalFetch = window.fetch.bind(window);
+    window.fetch = function (input, init) {
+        const opts = init ? Object.assign({}, init) : {};
+        const token = localStorage.getItem(TOKEN_KEY);
+        if (token) {
+            opts.headers = Object.assign({}, opts.headers, { Authorization: `Bearer ${token}` });
+        }
+        return originalFetch(input, opts);
+    };
+    window.buquenqueAuth = {
+        setToken(token) { localStorage.setItem(TOKEN_KEY, token); },
+        clearToken() { localStorage.removeItem(TOKEN_KEY); }
+    };
+})();
+
 let serverStartTime;
 
 // Variable para almacenar los pedidos nuevos
@@ -30,6 +47,7 @@ document.addEventListener('DOMContentLoaded', () => {
             try {
                 await fetch('/api/auth/logout', { method: 'POST' });
             } finally {
+                window.buquenqueAuth.clearToken();
                 window.location.href = '/login';
             }
         });
@@ -186,7 +204,12 @@ async function fetchServerStatus() {
     try {
         const response = await fetch('/api/server-status');
         const data = await response.json();
-        
+
+        if (!response.ok || !data || !Array.isArray(data.logs)) {
+            console.error('Respuesta inválida de /api/server-status:', data);
+            return;
+        }
+
         // Update server start time if not already set
         if (!serverStartTime) {
             serverStartTime = new Date(data.startTime);

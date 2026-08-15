@@ -937,43 +937,60 @@ app.use(session({
 }));
 
 // ---------------------------------------------------------------------
-// AUTENTICACIÓN POR TOKEN (Authorization: Bearer ...)
+// AUTENTICACIÓN POR TOKEN (Authorization: Bearer ...) - stateless (HMAC)
+// No depende de memoria compartida entre instancias serverless.
 // ---------------------------------------------------------------------
 
-const authTokens = new Map(); // token -> { username, expires }
-const TOKEN_TTL_MS = 1000 * 60 * 60 * 12; // 12 horas, igual que la cookie
+const TOKEN_TTL_MS = 1000 * 60 * 60 * 12;
+
+function base64UrlEncode(input) {
+    return Buffer.from(input).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function base64UrlDecode(input) {
+    input = input.replace(/-/g, '+').replace(/_/g, '/');
+    while (input.length % 4) input += '=';
+    return Buffer.from(input, 'base64').toString('utf8');
+}
+
+function signPayload(payloadStr) {
+    return crypto.createHmac('sha256', SESSION_SECRET).update(payloadStr).digest('hex');
+}
 
 function createAuthToken(username) {
-    const token = crypto.randomBytes(32).toString('hex');
-    authTokens.set(token, { username, expires: Date.now() + TOKEN_TTL_MS });
-    return token;
+    const payload = { username, expires: Date.now() + TOKEN_TTL_MS };
+    const payloadStr = JSON.stringify(payload);
+    const payloadB64 = base64UrlEncode(payloadStr);
+    const signature = signPayload(payloadB64);
+    return `${payloadB64}.${signature}`;
 }
 
 function getAuthFromToken(req) {
     const header = req.headers['authorization'] || '';
     const match = header.match(/^Bearer\s+(.+)$/i);
     if (!match) return null;
-    const entry = authTokens.get(match[1]);
-    if (!entry) return null;
-    if (entry.expires < Date.now()) {
-        authTokens.delete(match[1]);
+    const token = match[1];
+    const parts = token.split('.');
+    if (parts.length !== 2) return null;
+    const [payloadB64, signature] = parts;
+    const expectedSignature = signPayload(payloadB64);
+    if (signature.length !== expectedSignature.length) return null;
+    const sigMatches = crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expectedSignature));
+    if (!sigMatches) return null;
+    let payload;
+    try {
+        payload = JSON.parse(base64UrlDecode(payloadB64));
+    } catch (error) {
         return null;
     }
-    return { token: match[1], username: entry.username };
+    if (!payload || !payload.username || !payload.expires || payload.expires < Date.now()) return null;
+    return { token, username: payload.username };
 }
 
 function revokeAuthToken(req) {
-    const header = req.headers['authorization'] || '';
-    const match = header.match(/^Bearer\s+(.+)$/i);
-    if (match) authTokens.delete(match[1]);
+    // Los tokens firmados sin estado expiran solos con TOKEN_TTL_MS.
+    // No hay lista de revocación entre instancias serverless.
 }
-
-setInterval(() => {
-    const now = Date.now();
-    for (const [token, entry] of authTokens.entries()) {
-        if (entry.expires < now) authTokens.delete(token);
-    }
-}, 1000 * 60 * 30).unref();
 
 async function getAdminCredentials() {
     const snapshot = await rtdb.ref(ADMIN_AUTH_RTDB_PATH).once('value');
