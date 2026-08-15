@@ -127,7 +127,8 @@ const allowedOrigins = [
     'capacitor://localhost',                  // Capacitor iOS
     'http://localhost',                       // Pruebas en navegador
     'http://localhost:8100',                   // Ionic Dev Server
-    "http://localhost:5500"
+    "http://localhost:5500",
+    "https://backend-vercel-tan-sigma.vercel.app"
 ];
 
 // -----------------------------
