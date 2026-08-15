@@ -336,14 +336,6 @@ window.addEventListener('load', initDashboard);
 
 // Asegurar que los eventos se agreguen después de que el DOM esté completamente cargado
 document.addEventListener('DOMContentLoaded', () => {
-    const closeOrdersPanel = document.getElementById('close-orders-panel');
-
-    if (closeOrdersPanel) {
-        closeOrdersPanel.addEventListener('click', closeNewOrdersPanel);
-    } else {
-        console.error('Elemento con ID "close-orders-panel" no encontrado.');
-    }
-
     const fcmSubscribeButton = document.getElementById('fcm-subscribe-button');
     if (fcmSubscribeButton) {
         fcmSubscribeButton.addEventListener('click', subscribeFcmToken);
