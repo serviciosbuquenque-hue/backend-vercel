@@ -1067,7 +1067,10 @@ function isPublicRoute(req) {
 // PUBLIC_ROUTES (incluyendo el panel estático servido más abajo) exige
 // sesión iniciada.
 // ---------------------------------------------------------------------
+const STATIC_SHELL_PATHS = new Set(['/', '/scripts.js', '/styles.css', '/logo_2.png']);
+
 app.use((req, res, next) => {
+    if (req.method === 'GET' && STATIC_SHELL_PATHS.has(req.path)) return next();
     if (isPublicRoute(req)) return next();
     return requireAuth(req, res, next);
 });
@@ -1119,6 +1122,7 @@ app.post('/api/auth/logout', (req, res) => {
 });
 
 app.get('/api/auth/me', (req, res) => {
+    res.set('Cache-Control', 'no-store');
     if (req.session && req.session.isAuthenticated) {
         return res.json({ success: true, authenticated: true, username: req.session.username });
     }
