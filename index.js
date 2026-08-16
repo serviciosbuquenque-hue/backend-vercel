@@ -743,6 +743,64 @@ async function getSecondaryProductMap() {
     });
 }
 
+// -----------------------------------------------------------------------------
+async function sanitizarComprasYTotal(compras) {
+    const lista = Array.isArray(compras) ? compras : [];
+    const productMap = await getSecondaryProductMap();
+
+    const porNombre = new Map();
+    Object.entries(productMap).forEach(([key, prod]) => {
+        if (prod && prod.nombre) porNombre.set(normalizeNombreProducto(prod.nombre), key);
+    });
+
+    const comprasSaneadas = [];
+    let total = 0;
+
+    for (const item of lista) {
+        if (!item) continue;
+        const cantidad = Math.max(0, Math.floor(Number(item.quantity ?? item.cantidad ?? 0)));
+        if (cantidad <= 0) continue;
+
+        const posiblesIds = [item.id, item.productId, item.product_id, item.productoId, item.producto_id]
+            .filter(v => v !== undefined && v !== null && String(v).trim() !== '');
+
+        let key = null;
+        let productoInventario = null;
+        for (const posibleId of posiblesIds) {
+            if (productMap[posibleId]) { key = posibleId; productoInventario = productMap[posibleId]; break; }
+        }
+        if (!key && posiblesIds.length) {
+            const match = Object.entries(productMap).find(([, p]) => p && posiblesIds.some(pid => String(p.id) === String(pid)));
+            if (match) { key = match[0]; productoInventario = match[1]; }
+        }
+        if (!key) {
+            const nombreItem = item.name || item.nombre;
+            if (nombreItem) {
+                const posibleKey = porNombre.get(normalizeNombreProducto(nombreItem));
+                if (posibleKey) { key = posibleKey; productoInventario = productMap[posibleKey]; }
+            }
+        }
+
+        const nombreFinal = productoInventario && productoInventario.nombre
+            ? productoInventario.nombre
+            : String(item.name || item.nombre || 'Producto').trim() || 'Producto';
+
+        const precioUnitario = Math.max(0, Number(item.unitPrice ?? item.precio ?? 0)) || 0;
+        const precioUnitarioRedondeado = Math.round(precioUnitario * 100) / 100;
+
+        total += precioUnitarioRedondeado * cantidad;
+
+        comprasSaneadas.push({
+            id: key || (posiblesIds[0] !== undefined ? posiblesIds[0] : null),
+            name: nombreFinal,
+            unitPrice: precioUnitarioRedondeado,
+            quantity: cantidad
+        });
+    }
+
+    return { compras: comprasSaneadas, total: Math.round(total * 100) / 100 };
+}
+
 async function persistSecondaryProductMap(productMap) {
     const safeMap = productMap || {};
     await rtdb.ref('products').set(safeMap);
@@ -1788,6 +1846,13 @@ async function actualizarPedidoHandler(req, res) {
         }
         const patch = { ...(req.body || {}) };
         delete patch.id; // el id no se modifica
+
+        if (Array.isArray(patch.compras)) {
+            const { compras, total } = await sanitizarComprasYTotal(patch.compras);
+            patch.compras = compras;
+            patch.precio_compra_total = total;
+        }
+
         const actualizado = await updateSecondaryPushRecord(PEDIDOS_RTDB_PATH, req.params.id, patch);
         return res.json({ success: true, pedido: actualizado });
     } catch (error) {
@@ -1884,6 +1949,13 @@ async function actualizarPedidoAsignadoHandler(req, res) {
         }
         const patch = { ...(req.body || {}) };
         delete patch.id;
+
+        if (Array.isArray(patch.compras)) {
+            const { compras, total } = await sanitizarComprasYTotal(patch.compras);
+            patch.compras = compras;
+            patch.precio_compra_total = total;
+        }
+
         const actualizado = await updateSecondaryPushRecord(PEDIDOS_ASIGNADOS_RTDB_PATH, req.params.id, patch);
         return res.json({ success: true, pedido: actualizado });
     } catch (error) {
