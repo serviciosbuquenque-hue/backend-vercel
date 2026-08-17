@@ -561,7 +561,18 @@ function normalizeProductPayload(payload = {}) {
 }
 
 function normalizeNombreProducto(str) {
-    return String(str || '').trim().toLowerCase();
+    return String(str || '')
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toLowerCase();
+}
+
+function normalizarListaCompras(compras) {
+    if (Array.isArray(compras)) return compras;
+    if (compras && typeof compras === 'object') return Object.values(compras);
+    return [];
 }
 
 function normalizeIdComparable(value) {
@@ -575,6 +586,7 @@ function extraerCantidadDeCompra(item) {
 function extraerPosiblesIdsDeCompra(item) {
     const fuentes = [
         item.id, item.productId, item.product_id, item.productoId, item.producto_id,
+        item.idProducto, item.id_producto, item.itemId, item.item_id, item.uuid,
         item.sku, item.codigo, item.code,
         item.producto && item.producto.id, item.product && item.product.id
     ];
@@ -601,15 +613,18 @@ function resolverProductoDesdeCompra(item, productMap, porNombre) {
 
     if (posiblesIds.length) {
         const posiblesIdsNormalizados = posiblesIds.map(normalizeIdComparable);
-        const matchEntry = Object.entries(productMap).find(([, p]) => {
+        const matchEntry = Object.entries(productMap).find(([key, p]) => {
             if (!p) return false;
             const idProducto = normalizeIdComparable(p.id);
-            return idProducto !== '' && posiblesIdsNormalizados.includes(idProducto);
+            const idClave = normalizeIdComparable(key);
+            return (idProducto !== '' && posiblesIdsNormalizados.includes(idProducto))
+                || (idClave !== '' && posiblesIdsNormalizados.includes(idClave));
         });
         if (matchEntry) return { key: matchEntry[0], producto: matchEntry[1] };
     }
 
-    const nombreItem = item.name || item.nombre || (item.producto && item.producto.nombre) || (item.product && item.product.name);
+    const nombreItem = item.name || item.nombre || item.nombreProducto || item.producto_nombre
+        || (item.producto && item.producto.nombre) || (item.product && item.product.name);
     if (nombreItem) {
         const key = porNombre.get(normalizeNombreProducto(nombreItem));
         if (key) return { key, producto: productMap[key] };
@@ -626,8 +641,9 @@ function construirMapaPorNombre(productMap) {
     return porNombre;
 }
 
-async function descontarStockPorCompras(compras) {
-    if (!Array.isArray(compras) || compras.length === 0) {
+async function descontarStockPorCompras(comprasInput) {
+    const compras = normalizarListaCompras(comprasInput);
+    if (compras.length === 0) {
         return { actualizado: false, afectados: [], noEncontrados: [] };
     }
     const snapshot = await rtdb.ref('products').once('value');
@@ -646,7 +662,7 @@ async function descontarStockPorCompras(compras) {
         const resuelto = resolverProductoDesdeCompra(item, productMap, porNombre);
         if (!resuelto) {
             noEncontrados.push({ item, motivo: 'producto_no_encontrado' });
-            addLog(`WARN: descontarStockPorCompras no pudo resolver el producto del item: ${JSON.stringify(item)}`);
+            addLog(`WARN: descontarStockPorCompras no pudo resolver el producto del item: ${JSON.stringify(item)}. Nombres disponibles en inventario: ${JSON.stringify(Array.from(porNombre.keys()))}`);
             continue;
         }
 
@@ -699,8 +715,9 @@ async function descontarStockPorCompras(compras) {
 
 // -----------------------------------------------------------------------------
 // Devolución de stock al descartar/cancelar un pedido.
-async function restaurarStockPorCompras(compras) {
-    if (!Array.isArray(compras) || compras.length === 0) {
+async function restaurarStockPorCompras(comprasInput) {
+    const compras = normalizarListaCompras(comprasInput);
+    if (compras.length === 0) {
         return { actualizado: false, afectados: [], noEncontrados: [] };
     }
 
@@ -772,8 +789,8 @@ async function getSecondaryProductMap() {
 }
 
 // -----------------------------------------------------------------------------
-async function sanitizarComprasYTotal(compras) {
-    const lista = Array.isArray(compras) ? compras : [];
+async function sanitizarComprasYTotal(comprasInput) {
+    const lista = normalizarListaCompras(comprasInput);
     const productMap = await getSecondaryProductMap();
     const porNombre = construirMapaPorNombre(productMap);
 
@@ -1501,7 +1518,8 @@ app.post("/guardar-estadistica", rateLimitMiddleware, async (req, res) => {
             return res.status(400).json({ error: "Faltan campos obligatorios" });
         }
 
-        const tieneCompras = Array.isArray(nuevaEstadistica.compras) && nuevaEstadistica.compras.length > 0;
+        nuevaEstadistica.compras = normalizarListaCompras(nuevaEstadistica.compras);
+        const tieneCompras = nuevaEstadistica.compras.length > 0;
 
         // Ver comentario en getKnownIpsSet(): evita leer todas las
         // estadísticas/pedidos históricos en cada visita.
@@ -1716,7 +1734,8 @@ app.post('/send-pedido', rateLimitMiddleware, async (req, res) => {
 
         const overallSuccess = backupSaved || correoSuccess;
 
-        if (Array.isArray(orderData.compras) && orderData.compras.length > 0) {
+        orderData.compras = normalizarListaCompras(orderData.compras);
+        if (orderData.compras.length > 0) {
             const pedidoIdSec = orderData.pedidoId || null;
             let yaProcesado = false;
 
