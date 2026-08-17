@@ -2371,6 +2371,14 @@ let totalSseConnections = 0;
 
 app.get('/api/stream/:pathKey', async (req, res) => {
     try {
+        if (IS_SERVERLESS) {
+            return res.status(501).json({
+                success: false,
+                message: 'Streaming en tiempo real (SSE) no está disponible en este despliegue serverless. Usa polling sobre el endpoint REST equivalente (ya cacheado).',
+                pollInstead: true
+            });
+        }
+
         const { pathKey } = req.params || {};
         const cfg = SSE_ALLOWED_PATHS[pathKey];
         if (!cfg) {
@@ -2378,7 +2386,7 @@ app.get('/api/stream/:pathKey', async (req, res) => {
         }
 
         // Límite global de conexiones SSE
-        if (totalSseConnections >= 30) {
+        if (totalSseConnections >= 10) {
             return res.status(429).json({ success: false, message: 'Demasiadas conexiones en tiempo real activas, intenta más tarde.' });
         }
 
