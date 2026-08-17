@@ -560,15 +560,6 @@ function normalizeProductPayload(payload = {}) {
     };
 }
 
-function normalizeNombreProducto(str) {
-    return String(str || '')
-        .normalize('NFD')
-        .replace(/[\u0300-\u036f]/g, '')
-        .replace(/\s+/g, ' ')
-        .trim()
-        .toLowerCase();
-}
-
 function normalizarListaCompras(compras) {
     if (Array.isArray(compras)) return compras;
     if (compras && typeof compras === 'object') return Object.values(compras);
@@ -602,8 +593,9 @@ function extraerPosiblesIdsDeCompra(item) {
     return resultado;
 }
 
-function resolverProductoDesdeCompra(item, productMap, porNombre) {
+function resolverProductoDesdeCompra(item, productMap) {
     const posiblesIds = extraerPosiblesIdsDeCompra(item);
+    if (posiblesIds.length === 0) return null;
 
     for (const posibleId of posiblesIds) {
         if (productMap[posibleId] !== undefined) {
@@ -611,34 +603,16 @@ function resolverProductoDesdeCompra(item, productMap, porNombre) {
         }
     }
 
-    if (posiblesIds.length) {
-        const posiblesIdsNormalizados = posiblesIds.map(normalizeIdComparable);
-        const matchEntry = Object.entries(productMap).find(([key, p]) => {
-            if (!p) return false;
-            const idProducto = normalizeIdComparable(p.id);
-            const idClave = normalizeIdComparable(key);
-            return (idProducto !== '' && posiblesIdsNormalizados.includes(idProducto))
-                || (idClave !== '' && posiblesIdsNormalizados.includes(idClave));
-        });
-        if (matchEntry) return { key: matchEntry[0], producto: matchEntry[1] };
-    }
-
-    const nombreItem = item.name || item.nombre || item.nombreProducto || item.producto_nombre
-        || (item.producto && item.producto.nombre) || (item.product && item.product.name);
-    if (nombreItem) {
-        const key = porNombre.get(normalizeNombreProducto(nombreItem));
-        if (key) return { key, producto: productMap[key] };
-    }
-
-    return null;
-}
-
-function construirMapaPorNombre(productMap) {
-    const porNombre = new Map();
-    Object.entries(productMap).forEach(([key, prod]) => {
-        if (prod && prod.nombre) porNombre.set(normalizeNombreProducto(prod.nombre), key);
+    const posiblesIdsNormalizados = posiblesIds.map(normalizeIdComparable);
+    const matchEntry = Object.entries(productMap).find(([key, p]) => {
+        if (!p) return false;
+        const idProducto = normalizeIdComparable(p.id);
+        const idClave = normalizeIdComparable(key);
+        return (idProducto !== '' && posiblesIdsNormalizados.includes(idProducto))
+            || (idClave !== '' && posiblesIdsNormalizados.includes(idClave));
     });
-    return porNombre;
+
+    return matchEntry ? { key: matchEntry[0], producto: matchEntry[1] } : null;
 }
 
 async function descontarStockPorCompras(comprasInput) {
@@ -648,7 +622,6 @@ async function descontarStockPorCompras(comprasInput) {
     }
     const snapshot = await rtdb.ref('products').once('value');
     const productMap = snapshot.val() || {};
-    const porNombre = construirMapaPorNombre(productMap);
 
     let huboCambios = false;
     const afectados = [];
@@ -659,10 +632,10 @@ async function descontarStockPorCompras(comprasInput) {
         const cantidad = extraerCantidadDeCompra(item);
         if (cantidad <= 0) continue;
 
-        const resuelto = resolverProductoDesdeCompra(item, productMap, porNombre);
+        const resuelto = resolverProductoDesdeCompra(item, productMap);
         if (!resuelto) {
-            noEncontrados.push({ item, motivo: 'producto_no_encontrado' });
-            addLog(`WARN: descontarStockPorCompras no pudo resolver el producto del item: ${JSON.stringify(item)}. Nombres disponibles en inventario: ${JSON.stringify(Array.from(porNombre.keys()))}`);
+            noEncontrados.push({ item, motivo: 'producto_no_encontrado_por_id' });
+            addLog(`WARN: descontarStockPorCompras no pudo resolver el producto por ID. Item recibido: ${JSON.stringify(item)}`);
             continue;
         }
 
@@ -723,7 +696,6 @@ async function restaurarStockPorCompras(comprasInput) {
 
     const snapshot = await rtdb.ref('products').once('value');
     const productMap = snapshot.val() || {};
-    const porNombre = construirMapaPorNombre(productMap);
 
     let huboCambios = false;
     const afectados = [];
@@ -734,10 +706,10 @@ async function restaurarStockPorCompras(comprasInput) {
         const cantidad = extraerCantidadDeCompra(item);
         if (cantidad <= 0) continue;
 
-        const resuelto = resolverProductoDesdeCompra(item, productMap, porNombre);
+        const resuelto = resolverProductoDesdeCompra(item, productMap);
         if (!resuelto) {
-            noEncontrados.push({ item, motivo: 'producto_no_encontrado' });
-            addLog(`WARN: restaurarStockPorCompras no pudo resolver el producto del item: ${JSON.stringify(item)}`);
+            noEncontrados.push({ item, motivo: 'producto_no_encontrado_por_id' });
+            addLog(`WARN: restaurarStockPorCompras no pudo resolver el producto por ID. Item recibido: ${JSON.stringify(item)}`);
             continue;
         }
 
@@ -792,7 +764,6 @@ async function getSecondaryProductMap() {
 async function sanitizarComprasYTotal(comprasInput) {
     const lista = normalizarListaCompras(comprasInput);
     const productMap = await getSecondaryProductMap();
-    const porNombre = construirMapaPorNombre(productMap);
 
     const comprasSaneadas = [];
     let total = 0;
@@ -802,12 +773,12 @@ async function sanitizarComprasYTotal(comprasInput) {
         const cantidad = Math.max(0, Math.floor(Number(item.quantity ?? item.cantidad ?? 0)));
         if (cantidad <= 0) continue;
 
-        const resuelto = resolverProductoDesdeCompra(item, productMap, porNombre);
+        const resuelto = resolverProductoDesdeCompra(item, productMap);
         const key = resuelto ? resuelto.key : null;
         const productoInventario = resuelto ? resuelto.producto : null;
 
         if (!resuelto) {
-            addLog(`WARN: sanitizarComprasYTotal no pudo resolver el producto del item: ${JSON.stringify(item)}`);
+            addLog(`WARN: sanitizarComprasYTotal no pudo resolver el producto por ID. Item recibido: ${JSON.stringify(item)}`);
         }
 
         const nombreFinal = productoInventario && productoInventario.nombre
@@ -1693,19 +1664,7 @@ app.post('/send-pedido', rateLimitMiddleware, async (req, res) => {
     orderData.orderNumber = numeroOrdenResuelto || orderData.orderNumber || null;
     orderData.numero_orden = numeroOrdenResuelto || orderData.numero_orden || null;
 
-    let backupSaved = false;
-    let pedidoRef;
-
-    try {
-        pedidoRef = await rtdb.ref('pedidos').push({
-            ...orderData,
-            fecha_registro_backend: new Date().toISOString()
-        });
-        console.log('📦 Respaldo del pedido guardado en Firebase con key:', pedidoRef.key);
-        backupSaved = true;
-    } catch (firebaseBackupError) {
-        console.error('⚠️ No se pudo guardar el respaldo del pedido en Firebase:', firebaseBackupError);
-    }
+    const backupSaved = Boolean(orderData.pedidoId);
 
     try {
         let correoSuccess = false;
@@ -1767,12 +1726,6 @@ app.post('/send-pedido', rateLimitMiddleware, async (req, res) => {
                         } catch (uErr) {
                             console.warn('WARN: No se pudo marcar pedido secundario como stock_decrementado en /send-pedido:', uErr && uErr.message ? uErr.message : uErr);
                         }
-                    } else if (pedidoRef) {
-                        try {
-                            await rtdb.ref(`pedidos/${pedidoRef.key}`).update({ stock_decrementado: true, stock_afectados: resultadoStock.afectados || [] });
-                        } catch (uErr2) {
-                            console.warn('WARN: No se pudo marcar respaldo primario como stock_decrementado en /send-pedido:', uErr2 && uErr2.message ? uErr2.message : uErr2);
-                        }
                     }
                 } catch (errStock) {
                     console.warn('No fue posible descontar stock en /send-pedido:', errStock && errStock.message ? errStock.message : errStock);
@@ -1812,7 +1765,7 @@ app.post('/send-pedido', rateLimitMiddleware, async (req, res) => {
                 success: true,
                 message: 'Pedido recibido y guardado en Firebase.',
                 orderNumber: orderData.orderNumber || orderData.numero_orden || null,
-                pedidoKey: pedidoRef ? pedidoRef.key : null,
+                pedidoKey: orderData.pedidoId || null,
                 correoSuccess,
                 gasResponse,
                 backupSaved
