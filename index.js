@@ -564,175 +564,203 @@ function normalizeNombreProducto(str) {
     return String(str || '').trim().toLowerCase();
 }
 
-async function descontarStockPorCompras(compras) {
-    if (!Array.isArray(compras) || compras.length === 0) {
-        return { actualizado: false, afectados: [] };
-    }
-    // Cargar snapshot actual de productos para resolver claves y nombres
-    const snapshot = await rtdb.ref('products').once('value');
-    const productMap = snapshot.val() || {};
+function normalizeIdComparable(value) {
+    return String(value ?? '').trim().toLowerCase();
+}
 
-    // Map nombre normalizado -> key
+function extraerCantidadDeCompra(item) {
+    return Number(item.quantity ?? item.cantidad ?? item.qty ?? 1) || 0;
+}
+
+function extraerPosiblesIdsDeCompra(item) {
+    const fuentes = [
+        item.id, item.productId, item.product_id, item.productoId, item.producto_id,
+        item.sku, item.codigo, item.code,
+        item.producto && item.producto.id, item.product && item.product.id
+    ];
+    const vistos = new Set();
+    const resultado = [];
+    fuentes.forEach(v => {
+        if (v === undefined || v === null) return;
+        const str = String(v).trim();
+        if (str === '' || vistos.has(str)) return;
+        vistos.add(str);
+        resultado.push(v);
+    });
+    return resultado;
+}
+
+function resolverProductoDesdeCompra(item, productMap, porNombre) {
+    const posiblesIds = extraerPosiblesIdsDeCompra(item);
+
+    for (const posibleId of posiblesIds) {
+        if (productMap[posibleId] !== undefined) {
+            return { key: String(posibleId), producto: productMap[posibleId] };
+        }
+    }
+
+    if (posiblesIds.length) {
+        const posiblesIdsNormalizados = posiblesIds.map(normalizeIdComparable);
+        const matchEntry = Object.entries(productMap).find(([, p]) => {
+            if (!p) return false;
+            const idProducto = normalizeIdComparable(p.id);
+            return idProducto !== '' && posiblesIdsNormalizados.includes(idProducto);
+        });
+        if (matchEntry) return { key: matchEntry[0], producto: matchEntry[1] };
+    }
+
+    const nombreItem = item.name || item.nombre || (item.producto && item.producto.nombre) || (item.product && item.product.name);
+    if (nombreItem) {
+        const key = porNombre.get(normalizeNombreProducto(nombreItem));
+        if (key) return { key, producto: productMap[key] };
+    }
+
+    return null;
+}
+
+function construirMapaPorNombre(productMap) {
     const porNombre = new Map();
     Object.entries(productMap).forEach(([key, prod]) => {
         if (prod && prod.nombre) porNombre.set(normalizeNombreProducto(prod.nombre), key);
     });
+    return porNombre;
+}
+
+async function descontarStockPorCompras(compras) {
+    if (!Array.isArray(compras) || compras.length === 0) {
+        return { actualizado: false, afectados: [], noEncontrados: [] };
+    }
+    const snapshot = await rtdb.ref('products').once('value');
+    const productMap = snapshot.val() || {};
+    const porNombre = construirMapaPorNombre(productMap);
 
     let huboCambios = false;
     const afectados = [];
+    const noEncontrados = [];
 
     for (const item of compras) {
         if (!item) continue;
-        const cantidad = Number(item.quantity ?? item.cantidad ?? item.qty ?? 1) || 0;
+        const cantidad = extraerCantidadDeCompra(item);
         if (cantidad <= 0) continue;
 
-        const posiblesIds = [item.id, item.productId, item.product_id, item.productoId, item.producto_id]
-            .filter(v => v !== undefined && v !== null && String(v).trim() !== '');
-
-        let key = null;
-
-        // Buscar por clave directa en el mapa
-        for (const posibleId of posiblesIds) {
-            if (productMap[posibleId]) { key = posibleId; break; }
+        const resuelto = resolverProductoDesdeCompra(item, productMap, porNombre);
+        if (!resuelto) {
+            noEncontrados.push({ item, motivo: 'producto_no_encontrado' });
+            addLog(`WARN: descontarStockPorCompras no pudo resolver el producto del item: ${JSON.stringify(item)}`);
+            continue;
         }
 
-        // Buscar por campo id dentro de los productos
-        if (!key && posiblesIds.length) {
-            for (const posibleId of posiblesIds) {
-                const matchEntry = Object.entries(productMap).find(([k, p]) => p && String(p.id) === String(posibleId));
-                if (matchEntry) { key = matchEntry[0]; break; }
-            }
-        }
+        const key = resuelto.key;
 
-        // Buscar por nombre normalizado
-        if (!key) {
-            const nombreItem = item.name || item.nombre;
-            if (nombreItem) key = porNombre.get(normalizeNombreProducto(nombreItem)) || null;
-        }
-
-        if (!key) continue;
-
-        // Ejecutar transacción por producto para evitar race conditions
         try {
             const prodRef = rtdb.ref(`products/${key}`);
             const now = nowInTimeZone('America/Havana');
+            let stockAnteriorCapturado = null;
+            let seModifico = false;
+
             const txResult = await prodRef.transaction(current => {
-                if (!current) return; // abort
-                // Si no aplica control de stock, omitimos
-                if (!current.aplicar_stock) return current;
+                if (!current) return;
+                if (!current.aplicar_stock) return;
+
                 const stockActual = Number(current.stock ?? 0);
+                stockAnteriorCapturado = stockActual;
                 const stockNuevo = Math.max(0, stockActual - cantidad);
-                if (stockNuevo === stockActual) return current; // nada que hacer
-                current.stock = stockNuevo;
-                if (stockNuevo === 0 && current.aplicar_stock) {
-                    current.disponibilidad = false;
-                    current.activo = false;
+                if (stockNuevo === stockActual) return current;
+
+                const actualizado = { ...current, stock: stockNuevo, fecha_actualizacion: now };
+                if (stockNuevo === 0) {
+                    actualizado.disponibilidad = false;
+                    actualizado.activo = false;
                 }
-                current.fecha_actualizacion = now;
-                return current;
+                seModifico = true;
+                return actualizado;
             });
 
-            if (txResult && txResult.committed) {
+            if (txResult && txResult.committed && seModifico) {
                 const after = txResult.snapshot && txResult.snapshot.val();
                 huboCambios = true;
-                afectados.push({ id: after.id || key, nombre: after.nombre || (after && after.nombre) || key, stockAnterior: null, stockNuevo: Number(after.stock ?? 0) });
+                afectados.push({
+                    id: (after && after.id) || key,
+                    nombre: (after && after.nombre) || key,
+                    stockAnterior: stockAnteriorCapturado,
+                    stockNuevo: Number((after && after.stock) ?? 0)
+                });
+                addLog(`Stock descontado: producto ${key} (${cantidad} unidad(es)), ${stockAnteriorCapturado} -> ${Number((after && after.stock) ?? 0)}`);
+            } else if (!txResult || !txResult.committed) {
+                addLog(`WARN: la transacción de descuento de stock no se aplicó para el producto ${key}.`);
             }
         } catch (err) {
-            // No abortar todo por un fallo en una transacción individual
-            console.warn('WARN: transacción stock fallo para key', key, err && err.message ? err.message : err);
+            addLog(`ERROR: transacción de descuento de stock falló para el producto ${key}: ${err && err.message ? err.message : err}`);
         }
     }
 
-    return { actualizado: huboCambios, afectados };
+    return { actualizado: huboCambios, afectados, noEncontrados };
 }
 
 // -----------------------------------------------------------------------------
 // Devolución de stock al descartar/cancelar un pedido.
 async function restaurarStockPorCompras(compras) {
     if (!Array.isArray(compras) || compras.length === 0) {
-        return { actualizado: false, afectados: [] };
+        return { actualizado: false, afectados: [], noEncontrados: [] };
     }
 
     const snapshot = await rtdb.ref('products').once('value');
     const productMap = snapshot.val() || {};
-
-    const porNombre = new Map();
-    Object.entries(productMap).forEach(([key, prod]) => {
-        if (prod && prod.nombre) porNombre.set(normalizeNombreProducto(prod.nombre), key);
-    });
+    const porNombre = construirMapaPorNombre(productMap);
 
     let huboCambios = false;
     const afectados = [];
+    const noEncontrados = [];
 
     for (const item of compras) {
         if (!item) continue;
-        const cantidad = Number(item.quantity ?? item.cantidad ?? item.qty ?? 1) || 0;
+        const cantidad = extraerCantidadDeCompra(item);
         if (cantidad <= 0) continue;
 
-        const posiblesIds = [item.id, item.productId, item.product_id, item.productoId, item.producto_id]
-            .filter(v => v !== undefined && v !== null && String(v).trim() !== '');
-
-        let key = null;
-
-        // Buscar por clave directa en el mapa
-        for (const posibleId of posiblesIds) {
-            if (productMap[posibleId]) { key = posibleId; break; }
+        const resuelto = resolverProductoDesdeCompra(item, productMap, porNombre);
+        if (!resuelto) {
+            noEncontrados.push({ item, motivo: 'producto_no_encontrado' });
+            addLog(`WARN: restaurarStockPorCompras no pudo resolver el producto del item: ${JSON.stringify(item)}`);
+            continue;
         }
 
-        // Buscar por campo id dentro de los productos
-        if (!key && posiblesIds.length) {
-            for (const posibleId of posiblesIds) {
-                const matchEntry = Object.entries(productMap).find(([k, p]) => p && String(p.id) === String(posibleId));
-                if (matchEntry) { key = matchEntry[0]; break; }
-            }
-        }
+        const key = resuelto.key;
 
-        // Buscar por nombre normalizado
-        if (!key) {
-            const nombreItem = item.name || item.nombre;
-            if (nombreItem) key = porNombre.get(normalizeNombreProducto(nombreItem)) || null;
-        }
-
-        if (!key) continue;
-
-        // Ejecutar transacción por producto para evitar race conditions
         try {
             const prodRef = rtdb.ref(`products/${key}`);
             const now = nowInTimeZone('America/Havana');
+            let seModifico = false;
+
             const txResult = await prodRef.transaction(current => {
-                if (!current) return; // abort: el producto ya no existe
-                // Si el producto no maneja stock, no hay nada que devolver
-                if (!current.aplicar_stock) return current;
+                if (!current) return;
+                if (!current.aplicar_stock) return;
 
                 const stockActual = Number(current.stock ?? 0);
                 const stockNuevo = stockActual + cantidad;
-                current.stock = stockNuevo;
 
-                // Si estaba desactivado automáticamente por haberse quedado
-                // sin stock, lo reactivamos ahora que vuelve a tener unidades.
+                const actualizado = { ...current, stock: stockNuevo, fecha_actualizacion: now };
                 if (stockNuevo > 0 && current.disponibilidad === false && current.activo === false) {
-                    current.disponibilidad = true;
-                    current.activo = true;
+                    actualizado.disponibilidad = true;
+                    actualizado.activo = true;
                 }
-
-                current.fecha_actualizacion = now;
-                return current;
+                seModifico = true;
+                return actualizado;
             });
 
-            if (txResult && txResult.committed) {
+            if (txResult && txResult.committed && seModifico) {
                 const after = txResult.snapshot && txResult.snapshot.val();
                 if (after) {
                     huboCambios = true;
                     afectados.push({ id: after.id || key, nombre: after.nombre || key, stockNuevo: Number(after.stock ?? 0) });
+                    addLog(`Stock restaurado: producto ${key} (+${cantidad} unidad(es)), nuevo stock ${Number(after.stock ?? 0)}`);
                 }
             }
         } catch (err) {
-            // No abortar todo el descarte del pedido por un fallo puntual
-            console.warn('WARN: transacción de restauración de stock falló para key', key, err && err.message ? err.message : err);
+            addLog(`ERROR: transacción de restauración de stock falló para el producto ${key}: ${err && err.message ? err.message : err}`);
         }
     }
 
-    return { actualizado: huboCambios, afectados };
+    return { actualizado: huboCambios, afectados, noEncontrados };
 }
 
 async function getSecondaryProductMap() {
@@ -747,11 +775,7 @@ async function getSecondaryProductMap() {
 async function sanitizarComprasYTotal(compras) {
     const lista = Array.isArray(compras) ? compras : [];
     const productMap = await getSecondaryProductMap();
-
-    const porNombre = new Map();
-    Object.entries(productMap).forEach(([key, prod]) => {
-        if (prod && prod.nombre) porNombre.set(normalizeNombreProducto(prod.nombre), key);
-    });
+    const porNombre = construirMapaPorNombre(productMap);
 
     const comprasSaneadas = [];
     let total = 0;
@@ -761,24 +785,12 @@ async function sanitizarComprasYTotal(compras) {
         const cantidad = Math.max(0, Math.floor(Number(item.quantity ?? item.cantidad ?? 0)));
         if (cantidad <= 0) continue;
 
-        const posiblesIds = [item.id, item.productId, item.product_id, item.productoId, item.producto_id]
-            .filter(v => v !== undefined && v !== null && String(v).trim() !== '');
+        const resuelto = resolverProductoDesdeCompra(item, productMap, porNombre);
+        const key = resuelto ? resuelto.key : null;
+        const productoInventario = resuelto ? resuelto.producto : null;
 
-        let key = null;
-        let productoInventario = null;
-        for (const posibleId of posiblesIds) {
-            if (productMap[posibleId]) { key = posibleId; productoInventario = productMap[posibleId]; break; }
-        }
-        if (!key && posiblesIds.length) {
-            const match = Object.entries(productMap).find(([, p]) => p && posiblesIds.some(pid => String(p.id) === String(pid)));
-            if (match) { key = match[0]; productoInventario = match[1]; }
-        }
-        if (!key) {
-            const nombreItem = item.name || item.nombre;
-            if (nombreItem) {
-                const posibleKey = porNombre.get(normalizeNombreProducto(nombreItem));
-                if (posibleKey) { key = posibleKey; productoInventario = productMap[posibleKey]; }
-            }
+        if (!resuelto) {
+            addLog(`WARN: sanitizarComprasYTotal no pudo resolver el producto del item: ${JSON.stringify(item)}`);
         }
 
         const nombreFinal = productoInventario && productoInventario.nombre
@@ -790,6 +802,7 @@ async function sanitizarComprasYTotal(compras) {
 
         total += precioUnitarioRedondeado * cantidad;
 
+        const posiblesIds = extraerPosiblesIdsDeCompra(item);
         comprasSaneadas.push({
             id: key || (posiblesIds[0] !== undefined ? posiblesIds[0] : null),
             name: nombreFinal,
@@ -931,10 +944,6 @@ app.use(cors({
     credentials: true
 }));
 
-// Compresión Gzip/Brotli de todas las respuestas HTTP. Reduce
-// drásticamente el tráfico de "HTTP Response" (JSON de productos, packs,
-// pedidos, etc. pueden pesar varios KB sin comprimir y unos pocos KB
-// comprimidos). No comprime respuestas ya pequeñas (<1kb) por defecto.
 app.use(compression());
 
 // Middleware para procesar JSON y formularios con un límite mayor para
@@ -947,19 +956,6 @@ app.use(express.urlencoded({ extended: true, limit: '20mb' }));
 // conexión es segura y las cookies con `secure: true` no se comportan bien.
 app.set('trust proxy', 1);
 
-// =====================================================================
-// 🔐 AUTENTICACIÓN DEL PANEL DE ADMINISTRACIÓN
-// =====================================================================
-// Guarda usuario + hash de contraseña (bcrypt, nunca texto plano) en la
-// RTDB PRINCIPAL, en el nodo "admin_auth". Así se puede cambiar la
-// contraseña más adelante (endpoint /api/auth/change-password) sin tener
-// que tocar variables de entorno ni volver a desplegar el servidor.
-//
-// Primer arranque: si el nodo "admin_auth" no existe todavía, se crea
-// automáticamente a partir de las variables de entorno ADMIN_USERNAME y
-// ADMIN_PASSWORD (solo se usan una vez, para "sembrar" el usuario inicial;
-// la contraseña en texto plano nunca se guarda, solo su hash).
-// =====================================================================
 
 const ADMIN_AUTH_RTDB_PATH = 'admin_auth';
 const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
@@ -1537,34 +1533,49 @@ app.post("/guardar-estadistica", rateLimitMiddleware, async (req, res) => {
         };
 
         if (tieneCompras) {
+            let comprasParaGuardar = nuevaEstadistica.compras;
+            try {
+                const { compras: comprasSaneadas } = await sanitizarComprasYTotal(nuevaEstadistica.compras);
+                if (comprasSaneadas.length > 0) {
+                    comprasParaGuardar = comprasSaneadas;
+                } else {
+                    addLog('WARN: sanitizarComprasYTotal no resolvió ningún item; se guardan las compras originales sin sanear.');
+                }
+            } catch (sanitizeErr) {
+                addLog(`WARN: No se pudieron sanear las compras antes de guardar el pedido: ${sanitizeErr && sanitizeErr.message ? sanitizeErr.message : sanitizeErr}`);
+            }
+
             const orderNumber = await allocateNextOrderNumber();
             const pedidoId = await addSecondaryPushRecord(PEDIDOS_RTDB_PATH, {
                 ...registroBase,
-                compras: nuevaEstadistica.compras,
+                compras: comprasParaGuardar,
                 orderNumber,
                 numero_orden: orderNumber
             });
             addLog(`Pedido guardado correctamente en /pedidos (id: ${pedidoId}, orderNumber: ${orderNumber}).`);
 
+            let yaProcesado = false;
             try {
-                // Evitar doble descuento: comprobar si el registro ya tiene flag
                 const persistedPedido = await getSecondaryPushRecord(PEDIDOS_RTDB_PATH, pedidoId);
-                if (!persistedPedido || persistedPedido.stock_decrementado !== true) {
-                    const resultadoStock = await descontarStockPorCompras(nuevaEstadistica.compras);
-                    if (resultadoStock.actualizado) {
-                        addLog(`Stock actualizado por pedido ${orderNumber}: ${JSON.stringify(resultadoStock.afectados)}`);
-                    }
-                    // Marcar el pedido como procesado para evitar re-procesos
+                yaProcesado = Boolean(persistedPedido && persistedPedido.stock_decrementado === true);
+            } catch (lookupErr) {
+                addLog(`WARN: No se pudo verificar stock_decrementado del pedido ${pedidoId}, se continúa igualmente: ${lookupErr && lookupErr.message ? lookupErr.message : lookupErr}`);
+            }
+
+            if (!yaProcesado) {
+                try {
+                    const resultadoStock = await descontarStockPorCompras(comprasParaGuardar);
+                    addLog(`Resultado del descuento de stock para pedido ${orderNumber}: ${JSON.stringify(resultadoStock)}`);
                     try {
                         await updateSecondaryPushRecord(PEDIDOS_RTDB_PATH, pedidoId, { stock_decrementado: true, stock_afectados: resultadoStock.afectados || [] });
                     } catch (uErr) {
                         addLog(`WARN: No se pudo marcar pedido ${pedidoId} como stock_decrementado: ${uErr && uErr.message ? uErr.message : uErr}`);
                     }
-                } else {
-                    addLog(`Pedido ${pedidoId} ya tenía stock_decrementado=true; skip descuento.`);
+                } catch (stockError) {
+                    addLog(`ERROR descontando stock del pedido ${orderNumber}: ${stockError && stockError.message ? stockError.message : stockError}`);
                 }
-            } catch (stockError) {
-                addLog(`ERROR descontando stock del pedido ${orderNumber}: ${stockError && stockError.message ? stockError.message : stockError}`);
+            } else {
+                addLog(`Pedido ${pedidoId} ya tenía stock_decrementado=true; skip descuento.`);
             }
 
             return res.json({ message: "Estadística guardada correctamente", orderNumber, pedidoId });
@@ -1705,25 +1716,32 @@ app.post('/send-pedido', rateLimitMiddleware, async (req, res) => {
 
         const overallSuccess = backupSaved || correoSuccess;
 
-        // Descontar stock por compras si el pedido trae items (best-effort)
-        try {
-            if (Array.isArray(orderData.compras) && orderData.compras.length > 0) {
-                // Priorizar idempotencia usando el `pedidoId` que viene del flujo de /guardar-estadistica
-                const pedidoIdSec = orderData.pedidoId || null;
-                let yaProcesado = false;
+        if (Array.isArray(orderData.compras) && orderData.compras.length > 0) {
+            const pedidoIdSec = orderData.pedidoId || null;
+            let yaProcesado = false;
 
-                if (pedidoIdSec) {
+            if (pedidoIdSec) {
+                try {
                     const persisted = await getSecondaryPushRecord(PEDIDOS_RTDB_PATH, pedidoIdSec);
-                    if (persisted && persisted.stock_decrementado === true) yaProcesado = true;
+                    yaProcesado = Boolean(persisted && persisted.stock_decrementado === true);
+                } catch (lookupErr) {
+                    console.warn('WARN: No se pudo verificar stock_decrementado en /send-pedido, se continúa igualmente:', lookupErr && lookupErr.message ? lookupErr.message : lookupErr);
                 }
+            }
 
-                if (!yaProcesado) {
-                    const resultadoStock = await descontarStockPorCompras(orderData.compras);
-                    if (resultadoStock && resultadoStock.actualizado) {
-                        console.log('Stock actualizado por send-pedido:', JSON.stringify(resultadoStock.afectados));
+            if (!yaProcesado) {
+                try {
+                    let comprasParaDescontar = orderData.compras;
+                    try {
+                        const { compras: comprasSaneadas } = await sanitizarComprasYTotal(orderData.compras);
+                        if (comprasSaneadas.length > 0) comprasParaDescontar = comprasSaneadas;
+                    } catch (sanitizeErr) {
+                        console.warn('WARN: No se pudieron sanear las compras en /send-pedido:', sanitizeErr && sanitizeErr.message ? sanitizeErr.message : sanitizeErr);
                     }
 
-                    // Marcar registro secundario como procesado si existe
+                    const resultadoStock = await descontarStockPorCompras(comprasParaDescontar);
+                    console.log('Resultado del descuento de stock en /send-pedido:', JSON.stringify(resultadoStock));
+
                     if (pedidoIdSec) {
                         try {
                             await updateSecondaryPushRecord(PEDIDOS_RTDB_PATH, pedidoIdSec, { stock_decrementado: true, stock_afectados: resultadoStock.afectados || [] });
@@ -1731,19 +1749,18 @@ app.post('/send-pedido', rateLimitMiddleware, async (req, res) => {
                             console.warn('WARN: No se pudo marcar pedido secundario como stock_decrementado en /send-pedido:', uErr && uErr.message ? uErr.message : uErr);
                         }
                     } else if (pedidoRef) {
-                        // Fallback: marcar el respaldo primario si no hubo registro secundario
                         try {
                             await rtdb.ref(`pedidos/${pedidoRef.key}`).update({ stock_decrementado: true, stock_afectados: resultadoStock.afectados || [] });
                         } catch (uErr2) {
                             console.warn('WARN: No se pudo marcar respaldo primario como stock_decrementado en /send-pedido:', uErr2 && uErr2.message ? uErr2.message : uErr2);
                         }
                     }
-                } else {
-                    console.log('Pedido ya tenía stock_decrementado=true, skip descuento.');
+                } catch (errStock) {
+                    console.warn('No fue posible descontar stock en /send-pedido:', errStock && errStock.message ? errStock.message : errStock);
                 }
+            } else {
+                console.log('Pedido ya tenía stock_decrementado=true, skip descuento.');
             }
-        } catch (errStock) {
-            console.warn('No fue posible descontar stock en /send-pedido:', errStock && errStock.message ? errStock.message : errStock);
         }
 
         const nombreComprador = orderData.nombre_comprador || 'Cliente Nuevo';
