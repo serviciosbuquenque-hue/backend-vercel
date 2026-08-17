@@ -1896,8 +1896,25 @@ app.delete('/api/pedidos/:id', async (req, res) => {
         if (!existente) {
             return res.status(404).json({ success: false, message: 'Pedido no encontrado.' });
         }
+
         await deleteSecondaryPushRecord(PEDIDOS_RTDB_PATH, req.params.id);
-        return res.json({ success: true, deletedId: req.params.id });
+
+        let resultadoStock = null;
+        if (existente.stock_decrementado === true && Array.isArray(existente.compras) && existente.compras.length > 0) {
+            try {
+                resultadoStock = await restaurarStockPorCompras(existente.compras);
+                if (resultadoStock.actualizado) {
+                    addLog(`Stock restaurado por eliminación de pedido ${req.params.id}: ${JSON.stringify(resultadoStock.afectados)}`);
+                }
+                if (!resultadoStock.exitoso) {
+                    addLog(`ERROR: la restauración de stock del pedido eliminado ${req.params.id} quedó incompleta. noEncontrados: ${JSON.stringify(resultadoStock.noEncontrados)}, fallidos: ${JSON.stringify(resultadoStock.fallidos)}`);
+                }
+            } catch (stockError) {
+                addLog(`ERROR restaurando stock del pedido eliminado ${req.params.id}: ${stockError && stockError.message ? stockError.message : stockError}`);
+            }
+        }
+
+        return res.json({ success: true, deletedId: req.params.id, stockRestaurado: resultadoStock });
     } catch (error) {
         return res.status(500).json({ success: false, message: 'Error al eliminar el pedido', error: error.message });
     }
@@ -1998,8 +2015,25 @@ app.delete('/api/pedidos-asignados/:id', async (req, res) => {
         if (!existente) {
             return res.status(404).json({ success: false, message: 'Pedido asignado no encontrado.' });
         }
+
         await deleteSecondaryPushRecord(PEDIDOS_ASIGNADOS_RTDB_PATH, req.params.id);
-        return res.json({ success: true, deletedId: req.params.id });
+
+        let resultadoStock = null;
+        if (existente.stock_decrementado === true && Array.isArray(existente.compras) && existente.compras.length > 0) {
+            try {
+                resultadoStock = await restaurarStockPorCompras(existente.compras);
+                if (resultadoStock.actualizado) {
+                    addLog(`Stock restaurado por eliminación de pedido asignado ${req.params.id}: ${JSON.stringify(resultadoStock.afectados)}`);
+                }
+                if (!resultadoStock.exitoso) {
+                    addLog(`ERROR: la restauración de stock del pedido asignado eliminado ${req.params.id} quedó incompleta. noEncontrados: ${JSON.stringify(resultadoStock.noEncontrados)}, fallidos: ${JSON.stringify(resultadoStock.fallidos)}`);
+                }
+            } catch (stockError) {
+                addLog(`ERROR restaurando stock del pedido asignado eliminado ${req.params.id}: ${stockError && stockError.message ? stockError.message : stockError}`);
+            }
+        }
+
+        return res.json({ success: true, deletedId: req.params.id, stockRestaurado: resultadoStock });
     } catch (error) {
         return res.status(500).json({ success: false, message: 'Error al eliminar el pedido asignado', error: error.message });
     }
