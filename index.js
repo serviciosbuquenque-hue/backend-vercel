@@ -618,14 +618,16 @@ function resolverProductoDesdeCompra(item, productMap) {
 async function descontarStockPorCompras(comprasInput) {
     const compras = normalizarListaCompras(comprasInput);
     if (compras.length === 0) {
-        return { actualizado: false, afectados: [], noEncontrados: [] };
+        return { actualizado: false, exitoso: true, afectados: [], omitidos: [], noEncontrados: [], fallidos: [] };
     }
     const snapshot = await rtdb.ref('products').once('value');
     const productMap = snapshot.val() || {};
 
     let huboCambios = false;
     const afectados = [];
+    const omitidos = [];
     const noEncontrados = [];
+    const fallidos = [];
 
     for (const item of compras) {
         if (!item) continue;
@@ -635,7 +637,7 @@ async function descontarStockPorCompras(comprasInput) {
         const resuelto = resolverProductoDesdeCompra(item, productMap);
         if (!resuelto) {
             noEncontrados.push({ item, motivo: 'producto_no_encontrado_por_id' });
-            addLog(`WARN: descontarStockPorCompras no pudo resolver el producto por ID. Item recibido: ${JSON.stringify(item)}`);
+            addLog(`ERROR: descontarStockPorCompras no pudo resolver el producto por ID. Item recibido: ${JSON.stringify(item)}. Claves disponibles en products: ${Object.keys(productMap).length}`);
             continue;
         }
 
@@ -646,10 +648,14 @@ async function descontarStockPorCompras(comprasInput) {
             const now = nowInTimeZone('America/Havana');
             let stockAnteriorCapturado = null;
             let seModifico = false;
+            let noAplicaStock = false;
 
             const txResult = await prodRef.transaction(current => {
-                if (!current) return;
-                if (!current.aplicar_stock) return;
+                if (!current) return current;
+                if (!current.aplicar_stock) {
+                    noAplicaStock = true;
+                    return current;
+                }
 
                 const stockActual = Number(current.stock ?? 0);
                 stockAnteriorCapturado = stockActual;
@@ -675,15 +681,20 @@ async function descontarStockPorCompras(comprasInput) {
                     stockNuevo: Number((after && after.stock) ?? 0)
                 });
                 addLog(`Stock descontado: producto ${key} (${cantidad} unidad(es)), ${stockAnteriorCapturado} -> ${Number((after && after.stock) ?? 0)}`);
+            } else if (txResult && txResult.committed && noAplicaStock) {
+                omitidos.push({ id: key, motivo: 'aplicar_stock_desactivado' });
             } else if (!txResult || !txResult.committed) {
-                addLog(`WARN: la transacción de descuento de stock no se aplicó para el producto ${key}.`);
+                fallidos.push({ id: key, item, motivo: 'transaccion_no_confirmada' });
+                addLog(`ERROR: la transacción de descuento de stock no se confirmó para el producto ${key}. Item: ${JSON.stringify(item)}`);
             }
         } catch (err) {
+            fallidos.push({ id: key, item, motivo: 'excepcion', detalle: err && err.message ? err.message : String(err) });
             addLog(`ERROR: transacción de descuento de stock falló para el producto ${key}: ${err && err.message ? err.message : err}`);
         }
     }
 
-    return { actualizado: huboCambios, afectados, noEncontrados };
+    const exitoso = noEncontrados.length === 0 && fallidos.length === 0;
+    return { actualizado: huboCambios, exitoso, afectados, omitidos, noEncontrados, fallidos };
 }
 
 // -----------------------------------------------------------------------------
@@ -691,7 +702,7 @@ async function descontarStockPorCompras(comprasInput) {
 async function restaurarStockPorCompras(comprasInput) {
     const compras = normalizarListaCompras(comprasInput);
     if (compras.length === 0) {
-        return { actualizado: false, afectados: [], noEncontrados: [] };
+        return { actualizado: false, exitoso: true, afectados: [], omitidos: [], noEncontrados: [], fallidos: [] };
     }
 
     const snapshot = await rtdb.ref('products').once('value');
@@ -699,7 +710,9 @@ async function restaurarStockPorCompras(comprasInput) {
 
     let huboCambios = false;
     const afectados = [];
+    const omitidos = [];
     const noEncontrados = [];
+    const fallidos = [];
 
     for (const item of compras) {
         if (!item) continue;
@@ -709,7 +722,7 @@ async function restaurarStockPorCompras(comprasInput) {
         const resuelto = resolverProductoDesdeCompra(item, productMap);
         if (!resuelto) {
             noEncontrados.push({ item, motivo: 'producto_no_encontrado_por_id' });
-            addLog(`WARN: restaurarStockPorCompras no pudo resolver el producto por ID. Item recibido: ${JSON.stringify(item)}`);
+            addLog(`ERROR: restaurarStockPorCompras no pudo resolver el producto por ID. Item recibido: ${JSON.stringify(item)}`);
             continue;
         }
 
@@ -719,10 +732,14 @@ async function restaurarStockPorCompras(comprasInput) {
             const prodRef = rtdb.ref(`products/${key}`);
             const now = nowInTimeZone('America/Havana');
             let seModifico = false;
+            let noAplicaStock = false;
 
             const txResult = await prodRef.transaction(current => {
-                if (!current) return;
-                if (!current.aplicar_stock) return;
+                if (!current) return current;
+                if (!current.aplicar_stock) {
+                    noAplicaStock = true;
+                    return current;
+                }
 
                 const stockActual = Number(current.stock ?? 0);
                 const stockNuevo = stockActual + cantidad;
@@ -743,13 +760,20 @@ async function restaurarStockPorCompras(comprasInput) {
                     afectados.push({ id: after.id || key, nombre: after.nombre || key, stockNuevo: Number(after.stock ?? 0) });
                     addLog(`Stock restaurado: producto ${key} (+${cantidad} unidad(es)), nuevo stock ${Number(after.stock ?? 0)}`);
                 }
+            } else if (txResult && txResult.committed && noAplicaStock) {
+                omitidos.push({ id: key, motivo: 'aplicar_stock_desactivado' });
+            } else if (!txResult || !txResult.committed) {
+                fallidos.push({ id: key, item, motivo: 'transaccion_no_confirmada' });
+                addLog(`ERROR: la transacción de restauración de stock no se confirmó para el producto ${key}. Item: ${JSON.stringify(item)}`);
             }
         } catch (err) {
+            fallidos.push({ id: key, item, motivo: 'excepcion', detalle: err && err.message ? err.message : String(err) });
             addLog(`ERROR: transacción de restauración de stock falló para el producto ${key}: ${err && err.message ? err.message : err}`);
         }
     }
 
-    return { actualizado: huboCambios, afectados, noEncontrados };
+    const exitoso = noEncontrados.length === 0 && fallidos.length === 0;
+    return { actualizado: huboCambios, exitoso, afectados, omitidos, noEncontrados, fallidos };
 }
 
 async function getSecondaryProductMap() {
@@ -1555,8 +1579,15 @@ app.post("/guardar-estadistica", rateLimitMiddleware, async (req, res) => {
                 try {
                     const resultadoStock = await descontarStockPorCompras(comprasParaGuardar);
                     addLog(`Resultado del descuento de stock para pedido ${orderNumber}: ${JSON.stringify(resultadoStock)}`);
+                    if (!resultadoStock.exitoso) {
+                        addLog(`ERROR: el descuento de stock del pedido ${orderNumber} quedó incompleto. noEncontrados: ${JSON.stringify(resultadoStock.noEncontrados)}, fallidos: ${JSON.stringify(resultadoStock.fallidos)}`);
+                    }
                     try {
-                        await updateSecondaryPushRecord(PEDIDOS_RTDB_PATH, pedidoId, { stock_decrementado: true, stock_afectados: resultadoStock.afectados || [] });
+                        await updateSecondaryPushRecord(PEDIDOS_RTDB_PATH, pedidoId, {
+                            stock_decrementado: resultadoStock.exitoso,
+                            stock_afectados: resultadoStock.afectados || [],
+                            stock_error: resultadoStock.exitoso ? null : { noEncontrados: resultadoStock.noEncontrados || [], fallidos: resultadoStock.fallidos || [] }
+                        });
                     } catch (uErr) {
                         addLog(`WARN: No se pudo marcar pedido ${pedidoId} como stock_decrementado: ${uErr && uErr.message ? uErr.message : uErr}`);
                     }
@@ -1719,10 +1750,17 @@ app.post('/send-pedido', rateLimitMiddleware, async (req, res) => {
 
                     const resultadoStock = await descontarStockPorCompras(comprasParaDescontar);
                     console.log('Resultado del descuento de stock en /send-pedido:', JSON.stringify(resultadoStock));
+                    if (!resultadoStock.exitoso) {
+                        console.error('ERROR: el descuento de stock en /send-pedido quedó incompleto.', JSON.stringify({ noEncontrados: resultadoStock.noEncontrados, fallidos: resultadoStock.fallidos }));
+                    }
 
                     if (pedidoIdSec) {
                         try {
-                            await updateSecondaryPushRecord(PEDIDOS_RTDB_PATH, pedidoIdSec, { stock_decrementado: true, stock_afectados: resultadoStock.afectados || [] });
+                            await updateSecondaryPushRecord(PEDIDOS_RTDB_PATH, pedidoIdSec, {
+                                stock_decrementado: resultadoStock.exitoso,
+                                stock_afectados: resultadoStock.afectados || [],
+                                stock_error: resultadoStock.exitoso ? null : { noEncontrados: resultadoStock.noEncontrados || [], fallidos: resultadoStock.fallidos || [] }
+                            });
                         } catch (uErr) {
                             console.warn('WARN: No se pudo marcar pedido secundario como stock_decrementado en /send-pedido:', uErr && uErr.message ? uErr.message : uErr);
                         }
@@ -2794,6 +2832,9 @@ app.delete('/api/new-orders', async (req, res) => {
                     if (resultadoStock.actualizado) {
                         addLog(`Stock restaurado por pedido descartado (ip: ${ip}, fecha_hora_entrada: ${fecha_hora_entrada}): ${JSON.stringify(resultadoStock.afectados)}`);
                     }
+                    if (!resultadoStock.exitoso) {
+                        addLog(`ERROR: la restauración de stock del pedido descartado (ip: ${ip}, fecha_hora_entrada: ${fecha_hora_entrada}) quedó incompleta. noEncontrados: ${JSON.stringify(resultadoStock.noEncontrados)}, fallidos: ${JSON.stringify(resultadoStock.fallidos)}`);
+                    }
                 } catch (stockError) {
                     addLog(`ERROR restaurando stock del pedido descartado (ip: ${ip}, fecha_hora_entrada: ${fecha_hora_entrada}): ${stockError && stockError.message ? stockError.message : stockError}`);
                 }
@@ -2830,6 +2871,9 @@ app.delete('/api/new-orders', async (req, res) => {
                 const resultadoStock = await restaurarStockPorCompras(pedidoDescartado.compras);
                 if (resultadoStock.actualizado) {
                     addLog(`Stock restaurado por pedido descartado (ip: ${ip}, fecha_hora_entrada: ${fecha_hora_entrada}): ${JSON.stringify(resultadoStock.afectados)}`);
+                }
+                if (!resultadoStock.exitoso) {
+                    addLog(`ERROR: la restauración de stock del pedido descartado (ip: ${ip}, fecha_hora_entrada: ${fecha_hora_entrada}) quedó incompleta. noEncontrados: ${JSON.stringify(resultadoStock.noEncontrados)}, fallidos: ${JSON.stringify(resultadoStock.fallidos)}`);
                 }
             } catch (stockError) {
                 addLog(`ERROR restaurando stock del pedido descartado (ip: ${ip}, fecha_hora_entrada: ${fecha_hora_entrada}): ${stockError && stockError.message ? stockError.message : stockError}`);
