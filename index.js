@@ -2115,6 +2115,39 @@ app.get('/api/info', async (req, res) => {
     }
 });
 
+app.put('/api/info/:productId', async (req, res) => {
+    try {
+        const { productId } = req.params;
+        if (!productId) {
+            return res.status(400).json({ success: false, message: 'Falta el ID del producto.' });
+        }
+        const texto = String((req.body && req.body.info) || '').trim();
+        if (!texto) {
+            return res.status(400).json({ success: false, message: 'El campo "info" no puede estar vacío.' });
+        }
+        const entry = { id: productId, info: texto };
+        await rtdb.ref(`info/${productId}`).set(entry);
+        cacheDel('info');
+        return res.json({ success: true, entry });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al guardar la info del producto', error: error.message });
+    }
+});
+
+app.delete('/api/info/:productId', async (req, res) => {
+    try {
+        const { productId } = req.params;
+        if (!productId) {
+            return res.status(400).json({ success: false, message: 'Falta el ID del producto.' });
+        }
+        await rtdb.ref(`info/${productId}`).remove();
+        cacheDel('info');
+        return res.json({ success: true, deletedId: productId });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al eliminar la info del producto', error: error.message });
+    }
+});
+
 app.get('/api/pay', async (req, res) => {
     try {
         const pay = await getOrSetCache('pay', CACHE_TTL.PUBLIC_DATA, async () => {
