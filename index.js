@@ -212,6 +212,7 @@ async function cloudinaryUploadProductImage(source, desiredPublicId, folder = CL
     const uploadOptions = {
         folder,
         overwrite: true,
+        invalidate: true,
         resource_type: 'image',
         format: 'webp',
         fetch_format: 'webp',
@@ -249,31 +250,16 @@ function isUploadableImageValue(value) {
 async function processProductImages(imagenes, existingPublicIds = [], folder = CLOUDINARY_PRODUCTS_FOLDER) {
     const list = Array.isArray(imagenes) ? imagenes : (imagenes ? [imagenes] : []);
     const processed = [];
-    const usedPublicIds = new Set();
-    let nextReuseIndex = 0;
-
-    for (let i = 0; i < list.length; i++) {
-        const value = list[i];
+    for (const value of list) {
         if (isUploadableImageValue(value)) {
-            while (nextReuseIndex < existingPublicIds.length && usedPublicIds.has(existingPublicIds[nextReuseIndex])) {
-                nextReuseIndex += 1;
-            }
-            const desiredPublicId = nextReuseIndex < existingPublicIds.length
-                ? existingPublicIds[nextReuseIndex]
-                : undefined;
-            if (desiredPublicId) {
-                usedPublicIds.add(desiredPublicId);
-                nextReuseIndex += 1;
-            }
             try {
-                const publicId = await cloudinaryUploadProductImage(value, desiredPublicId, folder);
+                const publicId = await cloudinaryUploadProductImage(value, undefined, folder);
                 if (publicId) processed.push(publicId);
             } catch (error) {
                 console.warn('WARN: Se omitió una imagen al procesar el producto/pack:', error.message);
             }
         } else if (value) {
             processed.push(value);
-            usedPublicIds.add(value);
         }
     }
     return processed;
