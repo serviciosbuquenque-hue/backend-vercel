@@ -73,7 +73,8 @@ const CACHE_TTL = {
     PUBLIC_DATA: 60 * 1000,    // afiliados, mensajes, evento, info, pay
     NOTIFICATION: 30 * 1000,   // notification-banner
     RATINGS: 30 * 1000,        // product-ratings por producto
-    KNOWN_IPS: 5 * 60 * 1000   // set de IPs conocidas (usuario recurrente)
+    KNOWN_IPS: 5 * 60 * 1000,  // set de IPs conocidas (usuario recurrente)
+    CLOUDINARY_USAGE: 5 * 60 * 1000 // uso/consumo de la cuenta de Cloudinary
 };
 
 // Helper genérico: lee de caché o ejecuta fetchFn() y cachea el resultado.
@@ -2216,6 +2217,25 @@ app.get("/api/server-status", async (req, res) => {
     } catch (err) {
         addLog(`ERROR: No se pudo calcular uso de CPU/memoria: ${err.message}`);
         res.status(500).json({ error: 'Error obteniendo estadísticas del servidor' });
+    }
+});
+
+// Uso/consumo de la cuenta de Cloudinary (Admin API). Solo accesible con
+// sesión de administrador válida (queda detrás del gate de requireAuth
+// porque este endpoint no está en PUBLIC_ROUTES). Se cachea 5 minutos para
+// no golpear el Admin API de Cloudinary en cada carga del panel.
+app.get('/api/admin/cloudinary-usage', async (req, res) => {
+    try {
+        if (!cloudinaryConfigured) {
+            return res.status(503).json({ success: false, message: 'Cloudinary no está configurado en el servidor.' });
+        }
+        const usage = await getOrSetCache('cloudinary:usage', CACHE_TTL.CLOUDINARY_USAGE, async () => {
+            return await cloudinary.api.usage();
+        });
+        return res.json({ success: true, usage });
+    } catch (error) {
+        addLog(`ERROR /api/admin/cloudinary-usage: ${error.message}`);
+        return res.status(500).json({ success: false, message: 'Error al obtener el uso de Cloudinary', error: error.message });
     }
 });
 
