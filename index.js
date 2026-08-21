@@ -74,7 +74,8 @@ const CACHE_TTL = {
     NOTIFICATION: 30 * 1000,   // notification-banner
     RATINGS: 30 * 1000,        // product-ratings por producto
     KNOWN_IPS: 5 * 60 * 1000,  // set de IPs conocidas (usuario recurrente)
-    CLOUDINARY_USAGE: 5 * 60 * 1000 // uso/consumo de la cuenta de Cloudinary
+    CLOUDINARY_USAGE: 5 * 60 * 1000, // uso/consumo de la cuenta de Cloudinary
+    PUSH_LIST: 20 * 1000        // listados completos de /pedidos, /pedidos_asignados, /estadisticas
 };
 
 // Helper genérico: lee de caché o ejecuta fetchFn() y cachea el resultado.
@@ -89,7 +90,7 @@ async function getOrSetCache(key, ttlMs, fetchFn) {
 // stale-while-revalidate deja que el navegador siga usando la respuesta
 // vieja mientras revalida en segundo plano, sin bloquear al usuario.
 function setPublicCacheHeaders(res, maxAgeSec = 30, swrSec = 120) {
-    res.set('Cache-Control', `public, max-age=${maxAgeSec}, stale-while-revalidate=${swrSec}`);
+    res.set('Cache-Control', `public, max-age=${maxAgeSec}, s-maxage=${maxAgeSec}, stale-while-revalidate=${swrSec}`);
 }
 
 function paginateArray(array, req) {
@@ -381,9 +382,18 @@ async function writeSecondaryNode(refPath, payload) {
 
 // -----------------------------------------------------------------------------
 // Nueva arquitectura de ramas en la RTDB secundaria (datos-buquenque):
-//   /estadisticas      -> SOLO stats de visitas (sin el array "compras")
+//   /estadisticas      -> SOLO stats de visitas (sin "compras" ni datos de
+//                          comprador/envío, que en una visita sin compra
+//                          siempre llegan vacíos)
 //   /pedidos           -> pedidos completos (con "compras") creados desde /guardar-estadistica
-//   /pedidos_asignados -> copia de un pedido de /pedidos para darle seguimiento individual
+//   /pedidos_asignados -> registro DELGADO por pedido en seguimiento: solo
+//                          pedido_origen_id (referencia al pedido en
+//                          /pedidos) + los campos nuevos del seguimiento
+//                          (aceptado, entregado, pendiente_pago, pagado,
+//                          estado, fecha_asignacion, usuarioReincidente).
+//                          Ya NO es una copia completa del pedido; los
+//                          endpoints la reconstruyen al leer, uniendo con
+//                          /pedidos (ver hidratarPedidoAsignado más abajo).
 // -----------------------------------------------------------------------------
 const ESTADISTICAS_RTDB_PATH = 'estadisticas';
 const PEDIDOS_RTDB_PATH = 'pedidos';
@@ -399,33 +409,46 @@ async function addUserStatisticRecord(record) {
 
 async function clearUserStatistics() {
     await deleteSecondaryNode(ESTADISTICAS_RTDB_PATH);
+    cacheDel(pushListCacheKey(ESTADISTICAS_RTDB_PATH));
 }
 
-let knownIpsCache = { set: null, expires: 0 };
+const KNOWN_IPS_RTDB_PATH = 'known_ips';
 
-async function getKnownIpsSet() {
-    if (knownIpsCache.set && Date.now() < knownIpsCache.expires) {
-        return knownIpsCache.set;
-    }
-    const [estadisticas, pedidos] = await Promise.all([
-        listSecondaryPushCollection(ESTADISTICAS_RTDB_PATH),
-        listSecondaryPushCollection(PEDIDOS_RTDB_PATH)
-    ]);
-    const set = new Set();
-    estadisticas.forEach(item => { if (item && item.ip) set.add(item.ip); });
-    pedidos.forEach(item => { if (item && item.ip) set.add(item.ip); });
-    knownIpsCache = { set, expires: Date.now() + CACHE_TTL.KNOWN_IPS };
-    return set;
+async function isKnownIp(ip) {
+    if (!secondaryRtdb || !ip) return false;
+    const safeIp = String(ip).replace(/[.#$/\[\]]/g, '_');
+    const snapshot = await secondaryRtdb.ref(`${KNOWN_IPS_RTDB_PATH}/${safeIp}`).once('value');
+    return snapshot.val() === true;
+}
+
+async function markKnownIp(ip) {
+    if (!secondaryRtdb || !ip) return;
+    const safeIp = String(ip).replace(/[.#$/\[\]]/g, '_');
+    await secondaryRtdb.ref(`${KNOWN_IPS_RTDB_PATH}/${safeIp}`).set(true);
+}
+
+async function clearKnownIps() {
+    if (!secondaryRtdb) return;
+    await secondaryRtdb.ref(KNOWN_IPS_RTDB_PATH).remove();
 }
 
 // Helpers genéricos para colecciones basadas en push-id (objeto { id: valor })
-// usadas por /pedidos y /pedidos_asignados, para poder hacer CRUD por id.
+// usadas por /pedidos, /pedidos_asignados y /estadisticas, para poder hacer
+// CRUD por id. La lectura de la colección completa se cachea brevemente
+// (PUSH_LIST) porque el panel de gestión puede pedirla varias veces seguidas
+// (Resumen, Pedidos, Usuarios, checkUsuarioReincidente) y crece sin límite.
+function pushListCacheKey(refPath) {
+    return `pushlist:${refPath}`;
+}
+
 async function listSecondaryPushCollection(refPath) {
     if (!secondaryRtdb) return [];
-    const snapshot = await secondaryRtdb.ref(refPath).once('value');
-    const data = snapshot.val();
-    if (!data || typeof data !== 'object') return [];
-    return Object.entries(data).map(([id, value]) => ({ id, ...value }));
+    return getOrSetCache(pushListCacheKey(refPath), CACHE_TTL.PUSH_LIST, async () => {
+        const snapshot = await secondaryRtdb.ref(refPath).once('value');
+        const data = snapshot.val();
+        if (!data || typeof data !== 'object') return [];
+        return Object.entries(data).map(([id, value]) => ({ id, ...value }));
+    });
 }
 
 async function getSecondaryPushRecord(refPath, id) {
@@ -441,6 +464,7 @@ async function addSecondaryPushRecord(refPath, value) {
         throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
     }
     const ref = await secondaryRtdb.ref(refPath).push(value);
+    cacheDel(pushListCacheKey(refPath));
     return ref.key;
 }
 
@@ -449,6 +473,7 @@ async function updateSecondaryPushRecord(refPath, id, patch) {
         throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
     }
     await secondaryRtdb.ref(`${refPath}/${id}`).update(patch);
+    cacheDel(pushListCacheKey(refPath));
     return await getSecondaryPushRecord(refPath, id);
 }
 
@@ -457,6 +482,7 @@ async function deleteSecondaryPushRecord(refPath, id) {
         throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
     }
     await secondaryRtdb.ref(`${refPath}/${id}`).remove();
+    cacheDel(pushListCacheKey(refPath));
 }
 
 async function allocateNextOrderNumber() {
@@ -500,15 +526,49 @@ function ordersBelongToSameUser(a, b) {
     return false;
 }
 
+// -----------------------------------------------------------------------------
+// /pedidos_asignados ahora es un registro DELGADO: solo guarda el id del
+// pedido de origen (pedido_origen_id) más los campos nuevos propios del
+// seguimiento (estado, fecha_asignacion, usuarioReincidente, etc). Ya NO es
+// una copia completa del pedido. Estos helpers "hidratan" un registro
+// delgado uniéndolo con su pedido original de /pedidos para reconstruir el
+// mismo shape completo que antes devolvían los endpoints (compras,
+// nombre_comprador, direccion_envio, etc), así ningún consumidor (panel de
+// analíticas, app Android) necesita cambios.
+// -----------------------------------------------------------------------------
+function hidratarPedidoAsignadoConOrigen(asignado, pedidoOrigen) {
+    if (!asignado) return null;
+    if (!pedidoOrigen) return { ...asignado };
+    const { id: _idOrigenIgnorado, ...datosOrigen } = pedidoOrigen;
+    return { ...datosOrigen, ...asignado };
+}
+
+async function hidratarPedidoAsignado(asignado) {
+    if (!asignado) return null;
+    if (!asignado.pedido_origen_id) return asignado;
+    const pedidoOrigen = await getSecondaryPushRecord(PEDIDOS_RTDB_PATH, asignado.pedido_origen_id);
+    return hidratarPedidoAsignadoConOrigen(asignado, pedidoOrigen);
+}
+
+async function listarPedidosAsignadosHidratados() {
+    const [asignados, pedidos] = await Promise.all([
+        listSecondaryPushCollection(PEDIDOS_ASIGNADOS_RTDB_PATH),
+        listSecondaryPushCollection(PEDIDOS_RTDB_PATH)
+    ]);
+    const pedidosPorId = new Map(pedidos.map(p => [p.id, p]));
+    return asignados.map(asignado => hidratarPedidoAsignadoConOrigen(asignado, pedidosPorId.get(asignado.pedido_origen_id)));
+}
+
 // Revisa si el usuario dueño de "pedido" ya tiene compras anteriores
 // registradas en /pedidos o /pedidos_asignados (excluyendo el propio pedido).
 async function checkUsuarioReincidente(pedido, excludeId) {
-    const [pedidosPrevios, asignadosPrevios] = await Promise.all([
+    const [pedidosPrevios, asignadosHidratados] = await Promise.all([
         listSecondaryPushCollection(PEDIDOS_RTDB_PATH),
-        listSecondaryPushCollection(PEDIDOS_ASIGNADOS_RTDB_PATH)
+        listarPedidosAsignadosHidratados()
     ]);
 
-    const historial = [...pedidosPrevios, ...asignadosPrevios].filter(item => item.id !== excludeId);
+    const historial = [...pedidosPrevios, ...asignadosHidratados]
+        .filter(item => item.id !== excludeId && item.pedido_origen_id !== excludeId);
     return historial.some(item => ordersBelongToSameUser(item, pedido));
 }
 
@@ -912,22 +972,53 @@ async function writeSecondaryOrdersByBranch(branch, payload) {
     if (!secondaryRtdb) {
         throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
     }
-    await secondaryRtdb.ref(`orders/${branch}`).set(Array.isArray(payload) ? payload : []);
+    const list = Array.isArray(payload) ? payload : [];
+    const byId = {};
+    list.forEach(item => {
+        if (item && item.id) byId[item.id] = item;
+    });
+    await secondaryRtdb.ref(`orders/${branch}`).set(byId);
+}
+
+async function getSecondaryOrderById(branch, id) {
+    if (!secondaryRtdb) return null;
+    const snapshot = await secondaryRtdb.ref(`orders/${branch}/${id}`).once('value');
+    const data = snapshot.val();
+    return data ? { ...data, id } : null;
+}
+
+async function setSecondaryOrderById(branch, id, value) {
+    if (!secondaryRtdb) {
+        throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
+    }
+    await secondaryRtdb.ref(`orders/${branch}/${id}`).set(value);
+}
+
+async function patchSecondaryOrderById(branch, id, patch) {
+    if (!secondaryRtdb) {
+        throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
+    }
+    await secondaryRtdb.ref(`orders/${branch}/${id}`).update(patch);
+    return await getSecondaryOrderById(branch, id);
+}
+
+async function deleteSecondaryOrderById(branch, id) {
+    if (!secondaryRtdb) {
+        throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
+    }
+    await secondaryRtdb.ref(`orders/${branch}/${id}`).remove();
 }
 
 async function upsertSecondaryOrderRecord(order) {
     if (!secondaryRtdb) {
         throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
     }
-    const orders = await listSecondaryOrdersByBranch('managed');
-    const existingIndex = orders.findIndex(item => item.id === order.id);
-    if (existingIndex >= 0) {
-        orders[existingIndex] = { ...orders[existingIndex], ...order, fecha_actualizacion: nowInTimeZone('America/Havana') };
-    } else {
-        orders.push(order);
-    }
-    await writeSecondaryOrdersByBranch('managed', orders);
-    return orders;
+    const existing = await getSecondaryOrderById('managed', order.id);
+    const merged = existing
+        ? { ...existing, ...order, fecha_actualizacion: nowInTimeZone('America/Havana') }
+        : order;
+    await setSecondaryOrderById('managed', order.id, merged);
+    return merged;
 }
 
 app.use(cors({
@@ -1503,14 +1594,18 @@ app.post("/guardar-estadistica", rateLimitMiddleware, async (req, res) => {
         nuevaEstadistica.compras = normalizarListaCompras(nuevaEstadistica.compras);
         const tieneCompras = nuevaEstadistica.compras.length > 0;
 
-        // Ver comentario en getKnownIpsSet(): evita leer todas las
-        // estadísticas/pedidos históricos en cada visita.
-        const knownIps = await getKnownIpsSet();
-        const usuarioExistente = knownIps.has(nuevaEstadistica.ip);
-        knownIps.add(nuevaEstadistica.ip);
+        const usuarioExistente = await isKnownIp(nuevaEstadistica.ip);
+        if (!usuarioExistente) {
+            await markKnownIp(nuevaEstadistica.ip);
+        }
         const fechaHoraCuba = nowInTimeZone('America/Havana');
 
-        const registroBase = {
+        // Campos comunes a toda visita (con o sin compra). Los datos de
+        // comprador/envío/total NO van aquí: cuando no hay compra siempre
+        // llegan vacíos ("N/A"/0), así que guardarlos en /estadisticas era
+        // puro desperdicio de espacio. Solo se agregan más abajo cuando el
+        // registro sí es un pedido real.
+        const camposComunes = {
             ip: nuevaEstadistica.ip,
             pais: nuevaEstadistica.pais,
             fecha_hora_entrada: fechaHoraCuba,
@@ -1518,13 +1613,6 @@ app.post("/guardar-estadistica", rateLimitMiddleware, async (req, res) => {
             afiliado: nuevaEstadistica.afiliado || "Ninguno",
             duracion_sesion_segundos: nuevaEstadistica.duracion_sesion_segundos || 0,
             tiempo_carga_pagina_ms: nuevaEstadistica.tiempo_carga_pagina_ms || 0,
-            nombre_comprador: nuevaEstadistica.nombre_comprador || "N/A",
-            telefono_comprador: nuevaEstadistica.telefono_comprador || "N/A",
-            nombre_persona_entrega: nuevaEstadistica.nombre_persona_entrega || "N/A",
-            telefono_persona_entrega: nuevaEstadistica.telefono_persona_entrega || "N/A",
-            correo_comprador: nuevaEstadistica.correo_comprador || "N/A",
-            direccion_envio: nuevaEstadistica.direccion_envio || "N/A",
-            precio_compra_total: nuevaEstadistica.precio_compra_total || 0,
             navegador: nuevaEstadistica.navegador || "Desconocido",
             sistema_operativo: nuevaEstadistica.sistema_operativo || "Desconocido",
             tipo_usuario: usuarioExistente ? "Recurrente" : "Único",
@@ -1546,12 +1634,20 @@ app.post("/guardar-estadistica", rateLimitMiddleware, async (req, res) => {
             }
 
             const orderNumber = await allocateNextOrderNumber();
-            const pedidoId = await addSecondaryPushRecord(PEDIDOS_RTDB_PATH, {
-                ...registroBase,
+            const registroPedido = {
+                ...camposComunes,
+                nombre_comprador: nuevaEstadistica.nombre_comprador || "N/A",
+                telefono_comprador: nuevaEstadistica.telefono_comprador || "N/A",
+                nombre_persona_entrega: nuevaEstadistica.nombre_persona_entrega || "N/A",
+                telefono_persona_entrega: nuevaEstadistica.telefono_persona_entrega || "N/A",
+                correo_comprador: nuevaEstadistica.correo_comprador || "N/A",
+                direccion_envio: nuevaEstadistica.direccion_envio || "N/A",
+                precio_compra_total: nuevaEstadistica.precio_compra_total || 0,
                 compras: comprasParaGuardar,
                 orderNumber,
                 numero_orden: orderNumber
-            });
+            };
+            const pedidoId = await addSecondaryPushRecord(PEDIDOS_RTDB_PATH, registroPedido);
             addLog(`Pedido guardado correctamente en /pedidos (id: ${pedidoId}, orderNumber: ${orderNumber}).`);
 
             let yaProcesado = false;
@@ -1587,9 +1683,10 @@ app.post("/guardar-estadistica", rateLimitMiddleware, async (req, res) => {
 
             return res.json({ message: "Estadística guardada correctamente", orderNumber, pedidoId });
         } else {
-            // sin "compras": los stats puros no llevan compras. Push O(1),
-            // ya no se reescribe el arreglo completo de estadísticas.
-            const estadisticaId = await addUserStatisticRecord(registroBase);
+            // sin "compras": los stats puros no llevan compras ni datos de
+            // comprador/envío. Push O(1), ya no se reescribe el arreglo
+            // completo de estadísticas.
+            const estadisticaId = await addUserStatisticRecord(camposComunes);
             addLog("Estadística guardada correctamente en /estadisticas.");
             return res.json({ message: "Estadística guardada correctamente", estadisticaId });
         }
@@ -1914,7 +2011,6 @@ app.post('/api/pedidos/:id/asignar', async (req, res) => {
             return res.status(404).json({ success: false, message: 'Pedido no encontrado en /pedidos.' });
         }
 
-        const { id: _ignoredId, ...datosPedido } = pedidoOriginal;
         const usuarioReincidente = await checkUsuarioReincidente(pedidoOriginal, pedidoOriginal.id);
 
         const CAMPOS_ESTADO = ['aceptado', 'entregado', 'pendiente_pago', 'pagado', 'estado'];
@@ -1925,8 +2021,11 @@ app.post('/api/pedidos/:id/asignar', async (req, res) => {
             });
         }
 
+        // Registro delgado: NO se copian los datos del pedido (compras,
+        // nombre_comprador, direccion_envio, etc), solo la referencia al
+        // pedido de origen y los campos propios del seguimiento. El resto se
+        // reconstruye al leer, uniendo con /pedidos por pedido_origen_id.
         const nuevoRegistro = {
-            ...datosPedido,
             pedido_origen_id: pedidoOriginal.id,
             usuarioReincidente,
             fecha_asignacion: nowInTimeZone('America/Havana'),
@@ -1935,9 +2034,10 @@ app.post('/api/pedidos/:id/asignar', async (req, res) => {
 
         const asignadoId = await addSecondaryPushRecord(PEDIDOS_ASIGNADOS_RTDB_PATH, nuevoRegistro);
         const pedidoAsignado = await getSecondaryPushRecord(PEDIDOS_ASIGNADOS_RTDB_PATH, asignadoId);
+        const pedidoHidratado = hidratarPedidoAsignadoConOrigen(pedidoAsignado, pedidoOriginal);
 
         addLog(`Pedido ${pedidoOriginal.id} asignado a seguimiento (id: ${asignadoId}, reincidente: ${usuarioReincidente}).`);
-        return res.status(201).json({ success: true, pedido: pedidoAsignado });
+        return res.status(201).json({ success: true, pedido: pedidoHidratado });
     } catch (error) {
         return res.status(500).json({ success: false, message: 'Error al asignar el pedido', error: error.message });
     }
@@ -1949,7 +2049,7 @@ app.post('/api/pedidos/:id/asignar', async (req, res) => {
 
 app.get('/api/pedidos-asignados', async (req, res) => {
     try {
-        const pedidosAsignados = await listSecondaryPushCollection(PEDIDOS_ASIGNADOS_RTDB_PATH);
+        const pedidosAsignados = await listarPedidosAsignadosHidratados();
         const { items, paginated, total, limit, offset } = paginateArray(pedidosAsignados, req);
         if (paginated) {
             return res.json({ success: true, pedidosAsignados: items, total, limit, offset });
@@ -1966,7 +2066,8 @@ app.get('/api/pedidos-asignados/:id', async (req, res) => {
         if (!pedido) {
             return res.status(404).json({ success: false, message: 'Pedido asignado no encontrado.' });
         }
-        return res.json({ success: true, pedido });
+        const pedidoHidratado = await hidratarPedidoAsignado(pedido);
+        return res.json({ success: true, pedido: pedidoHidratado });
     } catch (error) {
         return res.status(500).json({ success: false, message: 'Error al obtener el pedido asignado', error: error.message });
     }
@@ -1980,15 +2081,29 @@ async function actualizarPedidoAsignadoHandler(req, res) {
         }
         const patch = { ...(req.body || {}) };
         delete patch.id;
+        delete patch.pedido_origen_id; // el vínculo con /pedidos no se reasigna por acá
 
+        // "compras" (y su total) ya no viven en el registro delgado de
+        // /pedidos_asignados: pertenecen al pedido de origen en /pedidos, así
+        // que cualquier edición de productos se aplica ahí.
         if (Array.isArray(patch.compras)) {
             const { compras, total } = await sanitizarComprasYTotal(patch.compras);
-            patch.compras = compras;
-            patch.precio_compra_total = total;
+            if (existente.pedido_origen_id) {
+                await updateSecondaryPushRecord(PEDIDOS_RTDB_PATH, existente.pedido_origen_id, {
+                    compras,
+                    precio_compra_total: total
+                });
+            }
+            delete patch.compras;
+            delete patch.precio_compra_total;
         }
 
-        const actualizado = await updateSecondaryPushRecord(PEDIDOS_ASIGNADOS_RTDB_PATH, req.params.id, patch);
-        return res.json({ success: true, pedido: actualizado });
+        const actualizado = Object.keys(patch).length > 0
+            ? await updateSecondaryPushRecord(PEDIDOS_ASIGNADOS_RTDB_PATH, req.params.id, patch)
+            : await getSecondaryPushRecord(PEDIDOS_ASIGNADOS_RTDB_PATH, req.params.id);
+
+        const pedidoHidratado = await hidratarPedidoAsignado(actualizado);
+        return res.json({ success: true, pedido: pedidoHidratado });
     } catch (error) {
         return res.status(500).json({ success: false, message: 'Error al actualizar el pedido asignado', error: error.message });
     }
@@ -2003,12 +2118,18 @@ app.delete('/api/pedidos-asignados/:id', async (req, res) => {
             return res.status(404).json({ success: false, message: 'Pedido asignado no encontrado.' });
         }
 
+        // El registro delgado no tiene "compras" ni "stock_decrementado":
+        // esos datos viven en el pedido de origen (/pedidos).
+        const pedidoOrigen = existente.pedido_origen_id
+            ? await getSecondaryPushRecord(PEDIDOS_RTDB_PATH, existente.pedido_origen_id)
+            : null;
+
         await deleteSecondaryPushRecord(PEDIDOS_ASIGNADOS_RTDB_PATH, req.params.id);
 
         let resultadoStock = null;
-        if (existente.stock_decrementado === true && Array.isArray(existente.compras) && existente.compras.length > 0) {
+        if (pedidoOrigen && pedidoOrigen.stock_decrementado === true && Array.isArray(pedidoOrigen.compras) && pedidoOrigen.compras.length > 0) {
             try {
-                resultadoStock = await restaurarStockPorCompras(existente.compras);
+                resultadoStock = await restaurarStockPorCompras(pedidoOrigen.compras);
                 if (resultadoStock.actualizado) {
                     addLog(`Stock restaurado por eliminación de pedido asignado ${req.params.id}: ${JSON.stringify(resultadoStock.afectados)}`);
                 }
@@ -2027,11 +2148,128 @@ app.delete('/api/pedidos-asignados/:id', async (req, res) => {
 });
 
 // =====================================================
-// 🔔 BANNER DE NOTIFICACIÓN (RTDB principal, nodo /notificationBanner)
-// Estructura: { id, icono, titulo, subtitulo, mensaje, tipo }
-// El "id" SIEMPRE se regenera al guardar (distinto al anterior) para que
-// el frontend de la tienda lo detecte como una notificación nueva.
+// 🧹 MIGRACIÓN DE REGISTROS YA EXISTENTES A FORMATO DELGADO
+// Todo lo de arriba solo afecta a los registros NUEVOS. Estos endpoints son
+// para correr una vez (desde el panel o con curl, requieren sesión de admin
+// porque no están en PUBLIC_ROUTES) y reducir el peso de lo que ya está
+// guardado en Firebase. Son idempotentes: se pueden correr varias veces sin
+// problema, los registros que ya están delgados/limpios se saltan.
 // =====================================================
+
+// Campos propios del seguimiento que SÍ se conservan en /pedidos_asignados.
+// Cualquier otro campo (compras, nombre_comprador, direccion_envio, etc.) es
+// una copia redundante del pedido en /pedidos y se elimina.
+const CAMPOS_PEDIDO_ASIGNADO_PROPIOS = [
+    'pedido_origen_id', 'usuarioReincidente', 'fecha_asignacion',
+    'aceptado', 'entregado', 'pendiente_pago', 'pagado', 'estado',
+    'importado_historico'
+];
+
+app.post('/api/pedidos-asignados/migrar-legado', async (req, res) => {
+    try {
+        const asignados = await listSecondaryPushCollection(PEDIDOS_ASIGNADOS_RTDB_PATH);
+        let migrados = 0;
+        let omitidos = 0;
+        const errores = [];
+
+        for (const asignado of asignados) {
+            const camposDeMas = Object.keys(asignado).filter(
+                campo => campo !== 'id' && !CAMPOS_PEDIDO_ASIGNADO_PROPIOS.includes(campo)
+            );
+            if (camposDeMas.length === 0) {
+                omitidos++;
+                continue;
+            }
+            if (!asignado.pedido_origen_id) {
+                // No se puede reconstruir sin saber a qué pedido pertenece: se
+                // deja intacto para no perder datos.
+                omitidos++;
+                continue;
+            }
+            const pedidoOrigen = await getSecondaryPushRecord(PEDIDOS_RTDB_PATH, asignado.pedido_origen_id);
+            if (!pedidoOrigen) {
+                // El pedido de origen ya no existe en /pedidos: no se puede
+                // reconstruir su información después, así que no se toca.
+                omitidos++;
+                continue;
+            }
+
+            const registroDelgado = {};
+            CAMPOS_PEDIDO_ASIGNADO_PROPIOS.forEach(campo => {
+                if (asignado[campo] !== undefined) registroDelgado[campo] = asignado[campo];
+            });
+
+            try {
+                await secondaryRtdb.ref(`${PEDIDOS_ASIGNADOS_RTDB_PATH}/${asignado.id}`).set(registroDelgado);
+                migrados++;
+            } catch (err) {
+                errores.push({ id: asignado.id, error: err.message });
+            }
+        }
+
+        cacheDel(pushListCacheKey(PEDIDOS_ASIGNADOS_RTDB_PATH));
+        addLog(`Migración de /pedidos_asignados a formato delgado: ${migrados} migrados, ${omitidos} omitidos, ${errores.length} errores.`);
+        return res.json({ success: true, total: asignados.length, migrados, omitidos, errores });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error migrando pedidos asignados', error: error.message });
+    }
+});
+
+// Campos de comprador/envío que en una visita SIN compra siempre quedaban
+// guardados con el valor por defecto ("N/A" / 0). Solo se eliminan cuando
+// TODOS valen exactamente eso: si un registro viejo tiene algún dato real
+// distinto de ese default, se deja intacto por seguridad.
+const CAMPOS_ESTADISTICA_REDUNDANTES = [
+    'nombre_comprador', 'telefono_comprador', 'nombre_persona_entrega',
+    'telefono_persona_entrega', 'correo_comprador', 'direccion_envio',
+    'precio_compra_total'
+];
+
+function estadisticaTieneSoloDefaults(registro) {
+    const textoEsDefault = (valor) => String(valor ?? 'N/A').trim().toUpperCase() === 'N/A';
+    return textoEsDefault(registro.nombre_comprador)
+        && textoEsDefault(registro.telefono_comprador)
+        && textoEsDefault(registro.nombre_persona_entrega)
+        && textoEsDefault(registro.telefono_persona_entrega)
+        && textoEsDefault(registro.correo_comprador)
+        && textoEsDefault(registro.direccion_envio)
+        && Number(registro.precio_compra_total ?? 0) === 0
+        && !Array.isArray(registro.compras);
+}
+
+app.post('/api/estadisticas/migrar-legado', async (req, res) => {
+    try {
+        const estadisticas = await listUserStatisticsFromSecondary();
+        let migrados = 0;
+        let omitidos = 0;
+        const errores = [];
+
+        for (const registro of estadisticas) {
+            const tieneCamposRedundantes = CAMPOS_ESTADISTICA_REDUNDANTES.some(campo => registro[campo] !== undefined);
+            if (!tieneCamposRedundantes || !estadisticaTieneSoloDefaults(registro)) {
+                omitidos++;
+                continue;
+            }
+
+            const limpio = { ...registro };
+            delete limpio.id;
+            CAMPOS_ESTADISTICA_REDUNDANTES.forEach(campo => delete limpio[campo]);
+
+            try {
+                await secondaryRtdb.ref(`${ESTADISTICAS_RTDB_PATH}/${registro.id}`).set(limpio);
+                migrados++;
+            } catch (err) {
+                errores.push({ id: registro.id, error: err.message });
+            }
+        }
+
+        cacheDel(pushListCacheKey(ESTADISTICAS_RTDB_PATH));
+        addLog(`Migración de /estadisticas a formato delgado: ${migrados} migrados, ${omitidos} omitidos, ${errores.length} errores.`);
+        return res.json({ success: true, total: estadisticas.length, migrados, omitidos, errores });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error migrando estadísticas', error: error.message });
+    }
+});
 const NOTIFICATION_BANNER_PATH = 'notificationBanner';
 
 app.get('/api/notification-banner', async (req, res) => {
@@ -2245,7 +2483,7 @@ app.post("/api/clear-statistics", async (req, res) => {
         addLog("Solicitud para limpiar estadísticas recibida");
 
         await clearUserStatistics();
-        knownIpsCache = { set: null, expires: 0 };
+        await clearKnownIps();
         addLog("Colección de estadísticas reiniciada en Firebase RTDB.");
 
         res.json({
@@ -2766,15 +3004,6 @@ app.get('/api/new-orders', async (req, res) => {
     }
 });
 
-app.get('/api/orders/new', async (req, res) => {
-    try {
-        const orders = secondaryRtdb ? await listSecondaryOrdersByBranch('new') : [];
-        return res.json({ success: true, orders });
-    } catch (error) {
-        return res.status(500).json({ success: false, message: 'Error al obtener pedidos nuevos', error: error.message });
-    }
-});
-
 app.get('/api/orders/managed', async (req, res) => {
     try {
         const orders = secondaryRtdb ? await listSecondaryOrdersByBranch('managed') : [];
@@ -3026,10 +3255,6 @@ app.post('/api/managed-orders', async (req, res) => {
 
         release = await lockfile.lock(managedOrdersFilePath);
 
-        const managedOrders = secondaryRtdb
-            ? await listSecondaryOrdersByBranch('managed')
-            : await readJsonFile(managedOrdersFilePath, []);
-
         const fechaActual = nowInTimeZone('America/Havana');
 
         const nuevoPedidoGestionado = {
@@ -3049,11 +3274,11 @@ app.post('/api/managed-orders', async (req, res) => {
             fecha_actualizacion: fechaActual
         };
 
-        managedOrders.push(nuevoPedidoGestionado);
-
         if (secondaryRtdb) {
-            await writeSecondaryOrdersByBranch('managed', managedOrders);
+            await setSecondaryOrderById('managed', nuevoPedidoGestionado.id, nuevoPedidoGestionado);
         } else {
+            const managedOrders = await readJsonFile(managedOrdersFilePath, []);
+            managedOrders.push(nuevoPedidoGestionado);
             await writeJsonFile(managedOrdersFilePath, managedOrders);
         }
 
@@ -3092,7 +3317,7 @@ app.post('/api/managed-orders', async (req, res) => {
             }
         }
 
-        res.json({ success: true, managedOrder: nuevoPedidoGestionado, managedOrders });
+        res.json({ success: true, managedOrder: nuevoPedidoGestionado });
     } catch (error) {
         addLog(`ERROR: No se pudo agregar el pedido al listado de gestión: ${error.message}`);
         res.status(500).json({ success: false, message: 'Error al agregar el pedido de gestión', error: error.message });
@@ -3123,37 +3348,31 @@ app.patch('/api/managed-orders/:id', async (req, res) => {
             return res.status(400).json({ success: false, message: 'No se proporcionaron campos válidos para actualizar.' });
         }
 
-        release = await lockfile.lock(managedOrdersFilePath);
-
-        const managedOrders = secondaryRtdb
-            ? await listSecondaryOrdersByBranch('managed')
-            : await readJsonFile(managedOrdersFilePath, []);
-        const index = managedOrders.findIndex(order => order.id === id);
-
-        if (index === -1) {
-            return res.status(404).json({ success: false, message: 'Pedido gestionado no encontrado.' });
-        }
-
-        // Normalizar tipos: booleanos para los estados, número para el precio
         if ('precio_total' in cambios) cambios.precio_total = Number(cambios.precio_total) || 0;
         for (const flag of ['aceptado', 'entregado', 'enviado_a_pagar', 'pagado', 'enviado_grupo_pagos']) {
             if (flag in cambios) cambios[flag] = Boolean(cambios[flag]);
         }
-
-        managedOrders[index] = {
-            ...managedOrders[index],
-            ...cambios,
-            fecha_actualizacion: nowInTimeZone('America/Havana')
-        };
+        cambios.fecha_actualizacion = nowInTimeZone('America/Havana');
 
         if (secondaryRtdb) {
-            await writeSecondaryOrdersByBranch('managed', managedOrders);
-        } else {
-            await writeJsonFile(managedOrdersFilePath, managedOrders);
+            const existing = await getSecondaryOrderById('managed', id);
+            if (!existing) {
+                return res.status(404).json({ success: false, message: 'Pedido gestionado no encontrado.' });
+            }
+            const updated = await patchSecondaryOrderById('managed', id, cambios);
+            addLog(`Pedido gestionado actualizado (id: ${id}): ${JSON.stringify(cambios)}`);
+            return res.json({ success: true, managedOrder: updated });
         }
 
+        release = await lockfile.lock(managedOrdersFilePath);
+        const managedOrders = await readJsonFile(managedOrdersFilePath, []);
+        const index = managedOrders.findIndex(order => order.id === id);
+        if (index === -1) {
+            return res.status(404).json({ success: false, message: 'Pedido gestionado no encontrado.' });
+        }
+        managedOrders[index] = { ...managedOrders[index], ...cambios };
+        await writeJsonFile(managedOrdersFilePath, managedOrders);
         addLog(`Pedido gestionado actualizado (id: ${id}): ${JSON.stringify(cambios)}`);
-
         res.json({ success: true, managedOrder: managedOrders[index] });
     } catch (error) {
         addLog(`ERROR: No se pudo actualizar el pedido gestionado: ${error.message}`);
@@ -3169,27 +3388,26 @@ app.delete('/api/managed-orders/:id', async (req, res) => {
     try {
         const { id } = req.params;
 
-        release = await lockfile.lock(managedOrdersFilePath);
-
-        const managedOrders = secondaryRtdb
-            ? await listSecondaryOrdersByBranch('managed')
-            : await readJsonFile(managedOrdersFilePath, []);
-        const orderToRemove = managedOrders.find(order => order.id === id);
-        const updatedOrders = managedOrders.filter(order => order.id !== id);
-
         if (secondaryRtdb) {
-            await writeSecondaryOrdersByBranch('managed', updatedOrders);
-        } else {
-            await writeJsonFile(managedOrdersFilePath, updatedOrders);
+            const existing = await getSecondaryOrderById('managed', id);
+            await deleteSecondaryOrderById('managed', id);
+            addLog(`Pedido eliminado del listado de gestión (id: ${id}).`);
+            return res.json({
+                success: true,
+                message: existing ? 'Pedido eliminado correctamente.' : 'El pedido ya no existía en el listado.'
+            });
         }
 
+        release = await lockfile.lock(managedOrdersFilePath);
+        const managedOrders = await readJsonFile(managedOrdersFilePath, []);
+        const orderToRemove = managedOrders.find(order => order.id === id);
+        const updatedOrders = managedOrders.filter(order => order.id !== id);
+        await writeJsonFile(managedOrdersFilePath, updatedOrders);
         addLog(`Pedido eliminado del listado de gestión (id: ${id}).`);
-
         const existed = Boolean(orderToRemove);
         res.json({
             success: true,
-            message: existed ? 'Pedido eliminado correctamente.' : 'El pedido ya no existía en el listado.',
-            managedOrders: updatedOrders
+            message: existed ? 'Pedido eliminado correctamente.' : 'El pedido ya no existía en el listado.'
         });
     } catch (error) {
         addLog(`ERROR: No se pudo eliminar el pedido gestionado: ${error.message}`);
