@@ -80,6 +80,7 @@ const CACHE_TTL = {
 
 // Helper genérico: lee de caché o ejecuta fetchFn() y cachea el resultado.
 async function getOrSetCache(key, ttlMs, fetchFn) {
+    if (IS_SERVERLESS) return await fetchFn();
     const cached = cacheGet(key);
     if (cached !== undefined) return cached;
     const fresh = await fetchFn();
@@ -1782,33 +1783,9 @@ app.post('/send-pedido', rateLimitMiddleware, async (req, res) => {
     const backupSaved = Boolean(orderData.pedidoId);
 
     try {
-        let correoSuccess = false;
-        let gasResponse = null;
-
-        if (GOOGLE_APPS_SCRIPT_CORREO_URL) {
-            console.log('Enviando datos a Google Apps Script para correo...');
-            const response = await fetch(GOOGLE_APPS_SCRIPT_CORREO_URL, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(orderData),
-            });
-
-            const textResponse = await response.text();
-            try {
-                gasResponse = JSON.parse(textResponse);
-            } catch (e) {
-                console.warn('Respuesta no es JSON válido:', textResponse);
-                gasResponse = { status: 'error', message: 'Respuesta no válida del script de correo', raw: textResponse };
-            }
-
-            correoSuccess = response.ok && gasResponse.status === 'success';
-        } else {
-            gasResponse = { status: 'skipped', message: 'No se configuró GOOGLE_APPS_SCRIPT_CORREO_URL' };
-        }
-
-        const overallSuccess = backupSaved || correoSuccess;
-
         orderData.compras = normalizarListaCompras(orderData.compras);
+        let stockResultado = null;
+
         if (orderData.compras.length > 0) {
             const pedidoIdSec = orderData.pedidoId || null;
             let yaProcesado = false;
@@ -1832,18 +1809,18 @@ app.post('/send-pedido', rateLimitMiddleware, async (req, res) => {
                         console.warn('WARN: No se pudieron sanear las compras en /send-pedido:', sanitizeErr && sanitizeErr.message ? sanitizeErr.message : sanitizeErr);
                     }
 
-                    const resultadoStock = await descontarStockPorCompras(comprasParaDescontar);
-                    console.log('Resultado del descuento de stock en /send-pedido:', JSON.stringify(resultadoStock));
-                    if (!resultadoStock.exitoso) {
-                        console.error('ERROR: el descuento de stock en /send-pedido quedó incompleto.', JSON.stringify({ noEncontrados: resultadoStock.noEncontrados, fallidos: resultadoStock.fallidos }));
+                    stockResultado = await descontarStockPorCompras(comprasParaDescontar);
+                    console.log('Resultado del descuento de stock en /send-pedido:', JSON.stringify(stockResultado));
+                    if (!stockResultado.exitoso) {
+                        console.error('ERROR: el descuento de stock en /send-pedido quedó incompleto.', JSON.stringify({ noEncontrados: stockResultado.noEncontrados, fallidos: stockResultado.fallidos }));
                     }
 
                     if (pedidoIdSec) {
                         try {
                             await updateSecondaryPushRecord(PEDIDOS_RTDB_PATH, pedidoIdSec, {
-                                stock_decrementado: resultadoStock.exitoso,
-                                stock_afectados: resultadoStock.afectados || [],
-                                stock_error: resultadoStock.exitoso ? null : { noEncontrados: resultadoStock.noEncontrados || [], fallidos: resultadoStock.fallidos || [] }
+                                stock_decrementado: stockResultado.exitoso,
+                                stock_afectados: stockResultado.afectados || [],
+                                stock_error: stockResultado.exitoso ? null : { noEncontrados: stockResultado.noEncontrados || [], fallidos: stockResultado.fallidos || [] }
                             });
                         } catch (uErr) {
                             console.warn('WARN: No se pudo marcar pedido secundario como stock_decrementado en /send-pedido:', uErr && uErr.message ? uErr.message : uErr);
@@ -1860,7 +1837,31 @@ app.post('/send-pedido', rateLimitMiddleware, async (req, res) => {
         const nombreComprador = orderData.nombre_comprador || 'Cliente Nuevo';
         const totalPedido = orderData.precio_compra_total || '0.00';
 
-        const message = {
+        let correoSuccess = false;
+        let gasResponse = { status: 'skipped', message: 'No se configuró GOOGLE_APPS_SCRIPT_CORREO_URL' };
+
+        if (GOOGLE_APPS_SCRIPT_CORREO_URL) {
+            gasResponse = { status: 'processing', message: 'Envío de correo en curso en segundo plano.' };
+            fetch(GOOGLE_APPS_SCRIPT_CORREO_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(orderData),
+            }).then(async (response) => {
+                const textResponse = await response.text();
+                let parsed;
+                try {
+                    parsed = JSON.parse(textResponse);
+                } catch (e) {
+                    parsed = { status: 'error', message: 'Respuesta no válida del script de correo', raw: textResponse };
+                }
+                const ok = response.ok && parsed.status === 'success';
+                addLog(`Correo del pedido ${orderData.orderNumber}: ${ok ? 'enviado correctamente' : 'con error (' + (parsed.message || 'sin detalle') + ')'}.`);
+            }).catch((err) => {
+                addLog(`ERROR enviando correo del pedido ${orderData.orderNumber}: ${err && err.message ? err.message : err}`);
+            });
+        }
+
+        admin.messaging().send({
             notification: {
                 title: '¡Nuevo Pedido Recibido! 📦',
                 body: `${nombreComprador} ha comprado un total de $${totalPedido}.`
@@ -1870,17 +1871,15 @@ app.post('/send-pedido', rateLimitMiddleware, async (req, res) => {
                 click_action: 'FLUTTER_NOTIFICATION_CLICK'
             },
             topic: 'pedidos'
-        };
+        }).then((responsePush) => {
+            addLog(`Push enviado con éxito: ${responsePush}`);
+            console.log('Push enviado con éxito:', responsePush);
+        }).catch((errorPush) => {
+            addLog(`ERROR enviando Push: ${errorPush.message}`);
+            console.error('Error enviando notificación Push:', errorPush);
+        });
 
-        admin.messaging().send(message)
-            .then((responsePush) => {
-                addLog(`Push enviado con éxito: ${responsePush}`);
-                console.log('Push enviado con éxito:', responsePush);
-            })
-            .catch((errorPush) => {
-                addLog(`ERROR enviando Push: ${errorPush.message}`);
-                console.error('Error enviando notificación Push:', errorPush);
-            });
+        const overallSuccess = backupSaved || Boolean(stockResultado);
 
         if (overallSuccess) {
             return res.status(200).json({
@@ -1897,7 +1896,7 @@ app.post('/send-pedido', rateLimitMiddleware, async (req, res) => {
         console.error('ERROR: No se pudo validar ninguna ruta de persistencia.');
         return res.status(502).json({
             success: false,
-            message: 'No se pudo guardar el pedido ni ejecutar el envío de correo.',
+            message: 'No se pudo guardar el pedido.',
             backupSaved,
             correoSuccess,
             gasResponse
