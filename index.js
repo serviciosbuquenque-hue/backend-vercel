@@ -2165,51 +2165,56 @@ const CAMPOS_PEDIDO_ASIGNADO_PROPIOS = [
     'importado_historico'
 ];
 
+async function processInBatches(items, batchSize, worker) {
+    for (let i = 0; i < items.length; i += batchSize) {
+        const batch = items.slice(i, i + batchSize);
+        await Promise.all(batch.map(worker));
+    }
+}
+
 app.post('/api/pedidos-asignados/migrar-legado', async (req, res) => {
     try {
-        const asignados = await listSecondaryPushCollection(PEDIDOS_ASIGNADOS_RTDB_PATH);
-        let migrados = 0;
-        let omitidos = 0;
-        const errores = [];
+        const limit = Math.max(1, Math.min(2000, parseInt(req.query.limit, 10) || 1000));
+        const [asignados, pedidos] = await Promise.all([
+            listSecondaryPushCollection(PEDIDOS_ASIGNADOS_RTDB_PATH),
+            listSecondaryPushCollection(PEDIDOS_RTDB_PATH)
+        ]);
+        const pedidosPorId = new Map(pedidos.map(p => [p.id, p]));
 
-        for (const asignado of asignados) {
+        const pendientes = asignados.filter(asignado => {
             const camposDeMas = Object.keys(asignado).filter(
                 campo => campo !== 'id' && !CAMPOS_PEDIDO_ASIGNADO_PROPIOS.includes(campo)
             );
-            if (camposDeMas.length === 0) {
-                omitidos++;
-                continue;
-            }
-            if (!asignado.pedido_origen_id) {
-                // No se puede reconstruir sin saber a qué pedido pertenece: se
-                // deja intacto para no perder datos.
-                omitidos++;
-                continue;
-            }
-            const pedidoOrigen = await getSecondaryPushRecord(PEDIDOS_RTDB_PATH, asignado.pedido_origen_id);
-            if (!pedidoOrigen) {
-                // El pedido de origen ya no existe en /pedidos: no se puede
-                // reconstruir su información después, así que no se toca.
-                omitidos++;
-                continue;
-            }
+            return camposDeMas.length > 0 && Boolean(asignado.pedido_origen_id);
+        });
 
+        let omitidos = asignados.length - pendientes.length;
+        let migrados = 0;
+        const errores = [];
+        const lote = pendientes.slice(0, limit);
+
+        await processInBatches(lote, 40, async (asignado) => {
+            const pedidoOrigen = pedidosPorId.get(asignado.pedido_origen_id);
+            if (!pedidoOrigen) {
+                omitidos++;
+                return;
+            }
             const registroDelgado = {};
             CAMPOS_PEDIDO_ASIGNADO_PROPIOS.forEach(campo => {
                 if (asignado[campo] !== undefined) registroDelgado[campo] = asignado[campo];
             });
-
             try {
                 await secondaryRtdb.ref(`${PEDIDOS_ASIGNADOS_RTDB_PATH}/${asignado.id}`).set(registroDelgado);
                 migrados++;
             } catch (err) {
                 errores.push({ id: asignado.id, error: err.message });
             }
-        }
+        });
 
         cacheDel(pushListCacheKey(PEDIDOS_ASIGNADOS_RTDB_PATH));
-        addLog(`Migración de /pedidos_asignados a formato delgado: ${migrados} migrados, ${omitidos} omitidos, ${errores.length} errores.`);
-        return res.json({ success: true, total: asignados.length, migrados, omitidos, errores });
+        const restantes = pendientes.length - lote.length;
+        addLog(`Migración de /pedidos_asignados a formato delgado: ${migrados} migrados, ${omitidos} omitidos, ${errores.length} errores, ${restantes} restantes.`);
+        return res.json({ success: true, total: asignados.length, migrados, omitidos, errores, restantes, hasMore: restantes > 0 });
     } catch (error) {
         return res.status(500).json({ success: false, message: 'Error migrando pedidos asignados', error: error.message });
     }
@@ -2239,33 +2244,35 @@ function estadisticaTieneSoloDefaults(registro) {
 
 app.post('/api/estadisticas/migrar-legado', async (req, res) => {
     try {
+        const limit = Math.max(1, Math.min(3000, parseInt(req.query.limit, 10) || 1500));
         const estadisticas = await listUserStatisticsFromSecondary();
-        let migrados = 0;
-        let omitidos = 0;
-        const errores = [];
 
-        for (const registro of estadisticas) {
+        const pendientes = estadisticas.filter(registro => {
             const tieneCamposRedundantes = CAMPOS_ESTADISTICA_REDUNDANTES.some(campo => registro[campo] !== undefined);
-            if (!tieneCamposRedundantes || !estadisticaTieneSoloDefaults(registro)) {
-                omitidos++;
-                continue;
-            }
+            return tieneCamposRedundantes && estadisticaTieneSoloDefaults(registro);
+        });
 
+        const omitidos = estadisticas.length - pendientes.length;
+        let migrados = 0;
+        const errores = [];
+        const lote = pendientes.slice(0, limit);
+
+        await processInBatches(lote, 40, async (registro) => {
             const limpio = { ...registro };
             delete limpio.id;
             CAMPOS_ESTADISTICA_REDUNDANTES.forEach(campo => delete limpio[campo]);
-
             try {
                 await secondaryRtdb.ref(`${ESTADISTICAS_RTDB_PATH}/${registro.id}`).set(limpio);
                 migrados++;
             } catch (err) {
                 errores.push({ id: registro.id, error: err.message });
             }
-        }
+        });
 
         cacheDel(pushListCacheKey(ESTADISTICAS_RTDB_PATH));
-        addLog(`Migración de /estadisticas a formato delgado: ${migrados} migrados, ${omitidos} omitidos, ${errores.length} errores.`);
-        return res.json({ success: true, total: estadisticas.length, migrados, omitidos, errores });
+        const restantes = pendientes.length - lote.length;
+        addLog(`Migración de /estadisticas a formato delgado: ${migrados} migrados, ${omitidos} omitidos, ${errores.length} errores, ${restantes} restantes.`);
+        return res.json({ success: true, total: estadisticas.length, migrados, omitidos, errores, restantes, hasMore: restantes > 0 });
     } catch (error) {
         return res.status(500).json({ success: false, message: 'Error migrando estadísticas', error: error.message });
     }
