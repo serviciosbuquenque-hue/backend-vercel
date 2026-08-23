@@ -486,6 +486,15 @@ async function deleteSecondaryPushRecord(refPath, id) {
     cacheDel(pushListCacheKey(refPath));
 }
 
+async function claimPedidoStockDecrement(refPath, id) {
+    if (!secondaryRtdb || !id) return true;
+    const txResult = await secondaryRtdb.ref(`${refPath}/${id}/stock_decrementado`).transaction(current => {
+        if (current === true) return;
+        return true;
+    });
+    return Boolean(txResult && txResult.committed);
+}
+
 async function allocateNextOrderNumber() {
     if (!secondaryRtdb) {
         throw new Error('La instancia secundaria de Firebase RTDB no está inicializada.');
@@ -1651,15 +1660,14 @@ app.post("/guardar-estadistica", rateLimitMiddleware, async (req, res) => {
             const pedidoId = await addSecondaryPushRecord(PEDIDOS_RTDB_PATH, registroPedido);
             addLog(`Pedido guardado correctamente en /pedidos (id: ${pedidoId}, orderNumber: ${orderNumber}).`);
 
-            let yaProcesado = false;
+            let puedoDescontar = true;
             try {
-                const persistedPedido = await getSecondaryPushRecord(PEDIDOS_RTDB_PATH, pedidoId);
-                yaProcesado = Boolean(persistedPedido && persistedPedido.stock_decrementado === true);
+                puedoDescontar = await claimPedidoStockDecrement(PEDIDOS_RTDB_PATH, pedidoId);
             } catch (lookupErr) {
-                addLog(`WARN: No se pudo verificar stock_decrementado del pedido ${pedidoId}, se continúa igualmente: ${lookupErr && lookupErr.message ? lookupErr.message : lookupErr}`);
+                addLog(`WARN: No se pudo reclamar stock_decrementado del pedido ${pedidoId}, se continúa igualmente: ${lookupErr && lookupErr.message ? lookupErr.message : lookupErr}`);
             }
 
-            if (!yaProcesado) {
+            if (puedoDescontar) {
                 try {
                     const resultadoStock = await descontarStockPorCompras(comprasParaGuardar);
                     addLog(`Resultado del descuento de stock para pedido ${orderNumber}: ${JSON.stringify(resultadoStock)}`);
@@ -1679,7 +1687,7 @@ app.post("/guardar-estadistica", rateLimitMiddleware, async (req, res) => {
                     addLog(`ERROR descontando stock del pedido ${orderNumber}: ${stockError && stockError.message ? stockError.message : stockError}`);
                 }
             } else {
-                addLog(`Pedido ${pedidoId} ya tenía stock_decrementado=true; skip descuento.`);
+                addLog(`Pedido ${pedidoId} ya tenía stock_decrementado=true (o ya estaba siendo procesado); skip descuento.`);
             }
 
             return res.json({ message: "Estadística guardada correctamente", orderNumber, pedidoId });
@@ -1788,18 +1796,17 @@ app.post('/send-pedido', rateLimitMiddleware, async (req, res) => {
 
         if (orderData.compras.length > 0) {
             const pedidoIdSec = orderData.pedidoId || null;
-            let yaProcesado = false;
+            let puedoDescontar = true;
 
             if (pedidoIdSec) {
                 try {
-                    const persisted = await getSecondaryPushRecord(PEDIDOS_RTDB_PATH, pedidoIdSec);
-                    yaProcesado = Boolean(persisted && persisted.stock_decrementado === true);
+                    puedoDescontar = await claimPedidoStockDecrement(PEDIDOS_RTDB_PATH, pedidoIdSec);
                 } catch (lookupErr) {
-                    console.warn('WARN: No se pudo verificar stock_decrementado en /send-pedido, se continúa igualmente:', lookupErr && lookupErr.message ? lookupErr.message : lookupErr);
+                    console.warn('WARN: No se pudo reclamar stock_decrementado en /send-pedido, se continúa igualmente:', lookupErr && lookupErr.message ? lookupErr.message : lookupErr);
                 }
             }
 
-            if (!yaProcesado) {
+            if (puedoDescontar) {
                 try {
                     let comprasParaDescontar = orderData.compras;
                     try {
@@ -1830,7 +1837,7 @@ app.post('/send-pedido', rateLimitMiddleware, async (req, res) => {
                     console.warn('No fue posible descontar stock en /send-pedido:', errStock && errStock.message ? errStock.message : errStock);
                 }
             } else {
-                console.log('Pedido ya tenía stock_decrementado=true, skip descuento.');
+                console.log('Pedido ya tenía stock_decrementado=true (o ya estaba siendo procesado), skip descuento.');
             }
         }
 
@@ -2117,30 +2124,16 @@ app.delete('/api/pedidos-asignados/:id', async (req, res) => {
             return res.status(404).json({ success: false, message: 'Pedido asignado no encontrado.' });
         }
 
-        // El registro delgado no tiene "compras" ni "stock_decrementado":
-        // esos datos viven en el pedido de origen (/pedidos).
-        const pedidoOrigen = existente.pedido_origen_id
-            ? await getSecondaryPushRecord(PEDIDOS_RTDB_PATH, existente.pedido_origen_id)
-            : null;
-
+        // Quitar un pedido de /pedidos_asignados NO elimina el pedido: el
+        // registro de origen sigue existiendo en /pedidos (vuelve a
+        // "pedidos nuevos") con su stock ya descontado. Por eso NUNCA se
+        // restaura stock aquí: hacerlo duplicaría la restauración que ya
+        // ocurre cuando el pedido se elimina de verdad desde /pedidos
+        // (DELETE /api/pedidos/:id), dejando stock de más cada vez que un
+        // pedido se asigna y desasigna de seguimiento.
         await deleteSecondaryPushRecord(PEDIDOS_ASIGNADOS_RTDB_PATH, req.params.id);
 
-        let resultadoStock = null;
-        if (pedidoOrigen && pedidoOrigen.stock_decrementado === true && Array.isArray(pedidoOrigen.compras) && pedidoOrigen.compras.length > 0) {
-            try {
-                resultadoStock = await restaurarStockPorCompras(pedidoOrigen.compras);
-                if (resultadoStock.actualizado) {
-                    addLog(`Stock restaurado por eliminación de pedido asignado ${req.params.id}: ${JSON.stringify(resultadoStock.afectados)}`);
-                }
-                if (!resultadoStock.exitoso) {
-                    addLog(`ERROR: la restauración de stock del pedido asignado eliminado ${req.params.id} quedó incompleta. noEncontrados: ${JSON.stringify(resultadoStock.noEncontrados)}, fallidos: ${JSON.stringify(resultadoStock.fallidos)}`);
-                }
-            } catch (stockError) {
-                addLog(`ERROR restaurando stock del pedido asignado eliminado ${req.params.id}: ${stockError && stockError.message ? stockError.message : stockError}`);
-            }
-        }
-
-        return res.json({ success: true, deletedId: req.params.id, stockRestaurado: resultadoStock });
+        return res.json({ success: true, deletedId: req.params.id, stockRestaurado: null });
     } catch (error) {
         return res.status(500).json({ success: false, message: 'Error al eliminar el pedido asignado', error: error.message });
     }
@@ -3495,6 +3488,18 @@ app.post("/rate-product", async (req, res) => {
     // para que el próximo GET /product-ratings no vuelva a golpear Firebase.
     cacheSet(`ratings:${safeProductId}`, { avgRating, totalVotes }, CACHE_TTL.RATINGS);
 
+    // Mantiene un nodo plano ratings_summary/{productId} = {avgRating, totalVotes}
+    // sincronizado en cada voto. Esto permite que el frontend pida el
+    // resumen de TODOS los productos en una sola petición (GET /api/ratings-summary)
+    // en vez de una petición por producto, sin tocar la estructura de /ratings
+    // que ya usa /rate-product y /product-ratings.
+    try {
+      await rtdb.ref(`ratings_summary/${safeProductId}`).set({ avgRating, totalVotes });
+      cacheDel('ratings-summary');
+    } catch (summaryErr) {
+      addLog(`WARN: no se pudo actualizar ratings_summary/${safeProductId}: ${summaryErr && summaryErr.message ? summaryErr.message : summaryErr}`);
+    }
+
     return res.json({
       success: true,
       productId: safeProductId,
@@ -3536,6 +3541,84 @@ app.get("/product-ratings", async (req, res) => {
     console.error("Error /product-ratings:", err);
     return res.status(500).json({ success: false, message: err.message });
   }
+});
+
+// GET /api/ratings-summary -> devuelve TODOS los ratings de una sola vez
+// (productId -> { avgRating, totalVotes }), leyendo el nodo plano
+// ratings_summary que /rate-product mantiene sincronizado en cada voto.
+// Pensado para que el frontend deje de pedir /product-ratings uno por uno
+// (miles de peticiones en catálogos grandes) y en su lugar pinte todas las
+// estrellas con UNA sola petición al cargar la página.
+app.get('/api/ratings-summary', async (req, res) => {
+    try {
+        const summary = await getOrSetCache('ratings-summary', CACHE_TTL.RATINGS, async () => {
+            const snapshot = await rtdb.ref('ratings_summary').once('value');
+            return snapshot.val() || {};
+        });
+        setPublicCacheHeaders(res, 20, 60);
+        return res.json({ success: true, ratings: summary });
+    } catch (err) {
+        console.error('Error /api/ratings-summary:', err);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// GET /api/bootstrap -> junta en UNA sola respuesta todo lo que la página
+// pide por separado al cargar (products, packs, evento, info, mensajes,
+// notification-banner, pay, ratings-summary). Cada pieza sigue usando su
+// propia caché en memoria (getOrSetCache), así que esto no duplica lecturas
+// a Firebase: solo evita que el frontend dispare 7-8 invocaciones de
+// función serverless en Vercel en vez de una. Los endpoints individuales
+// (/api/products, /api/packs, etc.) se mantienen intactos para el panel de
+// administración y para el polling de watchFirebasePath.
+app.get('/api/bootstrap', async (req, res) => {
+    try {
+        const [productMap, packMap, banner, mensajes, evento, info, pay, ratings] = await Promise.all([
+            getSecondaryProductMap(),
+            getPackMap(),
+            getOrSetCache('notification-banner', CACHE_TTL.NOTIFICATION, async () => {
+                const snapshot = await rtdb.ref(NOTIFICATION_BANNER_PATH).once('value');
+                return snapshot.val() || null;
+            }),
+            getOrSetCache('mensajes', CACHE_TTL.PUBLIC_DATA, async () => {
+                const snapshot = await rtdb.ref('mensajes').once('value');
+                const data = snapshot.val();
+                return Array.isArray(data) ? data : (data ? Object.values(data) : []);
+            }),
+            getOrSetCache('evento', CACHE_TTL.PUBLIC_DATA, async () => {
+                const snapshot = await rtdb.ref('evento').once('value');
+                return snapshot.val() || null;
+            }),
+            getOrSetCache('info', CACHE_TTL.PUBLIC_DATA, async () => {
+                const snapshot = await rtdb.ref('info').once('value');
+                const data = snapshot.val();
+                return Array.isArray(data) ? data : (data ? Object.values(data) : []);
+            }),
+            getOrSetCache('pay', CACHE_TTL.PUBLIC_DATA, async () => {
+                const snapshot = await rtdb.ref('pay').once('value');
+                return snapshot.val() || null;
+            }),
+            getOrSetCache('ratings-summary', CACHE_TTL.RATINGS, async () => {
+                const snapshot = await rtdb.ref('ratings_summary').once('value');
+                return snapshot.val() || {};
+            })
+        ]);
+
+        setPublicCacheHeaders(res, 20, 60);
+        return res.json({
+            success: true,
+            products: Object.values(productMap || {}),
+            packs: Object.values(packMap || {}),
+            banner: banner || null,
+            mensajes: mensajes || [],
+            evento: evento || null,
+            info: info || [],
+            pay: pay || null,
+            ratings: ratings || {}
+        });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error al obtener el bootstrap', error: error.message });
+    }
 });
 
 // =====================================================
