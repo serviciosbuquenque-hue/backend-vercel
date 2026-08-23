@@ -1848,12 +1848,16 @@ app.post('/send-pedido', rateLimitMiddleware, async (req, res) => {
         let gasResponse = { status: 'skipped', message: 'No se configuró GOOGLE_APPS_SCRIPT_CORREO_URL' };
 
         if (GOOGLE_APPS_SCRIPT_CORREO_URL) {
-            gasResponse = { status: 'processing', message: 'Envío de correo en curso en segundo plano.' };
-            fetch(GOOGLE_APPS_SCRIPT_CORREO_URL, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(orderData),
-            }).then(async (response) => {
+            const CORREO_TIMEOUT_MS = 15000;
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), CORREO_TIMEOUT_MS);
+            try {
+                const response = await fetch(GOOGLE_APPS_SCRIPT_CORREO_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(orderData),
+                    signal: controller.signal
+                });
                 const textResponse = await response.text();
                 let parsed;
                 try {
@@ -1861,30 +1865,40 @@ app.post('/send-pedido', rateLimitMiddleware, async (req, res) => {
                 } catch (e) {
                     parsed = { status: 'error', message: 'Respuesta no válida del script de correo', raw: textResponse };
                 }
-                const ok = response.ok && parsed.status === 'success';
-                addLog(`Correo del pedido ${orderData.orderNumber}: ${ok ? 'enviado correctamente' : 'con error (' + (parsed.message || 'sin detalle') + ')'}.`);
-            }).catch((err) => {
-                addLog(`ERROR enviando correo del pedido ${orderData.orderNumber}: ${err && err.message ? err.message : err}`);
-            });
+                correoSuccess = Boolean(response.ok && parsed.status === 'success');
+                gasResponse = parsed;
+                addLog(`Correo del pedido ${orderData.orderNumber}: ${correoSuccess ? 'enviado correctamente' : 'con error (' + (parsed.message || 'sin detalle') + ')'}.`);
+            } catch (err) {
+                const esTimeout = err && err.name === 'AbortError';
+                correoSuccess = false;
+                gasResponse = { status: 'error', message: esTimeout ? `Timeout tras ${CORREO_TIMEOUT_MS}ms esperando a Apps Script` : (err && err.message ? err.message : String(err)) };
+                addLog(`ERROR enviando correo del pedido ${orderData.orderNumber}: ${gasResponse.message}`);
+            } finally {
+                clearTimeout(timeoutId);
+            }
         }
 
-        admin.messaging().send({
-            notification: {
-                title: '¡Nuevo Pedido Recibido! 📦',
-                body: `${nombreComprador} ha comprado un total de $${totalPedido}.`
-            },
-            data: {
-                origen: String(orderData.origen || 'web'),
-                click_action: 'FLUTTER_NOTIFICATION_CLICK'
-            },
-            topic: 'pedidos'
-        }).then((responsePush) => {
+        // Mismo problema de fire-and-forget aplicaba al push: se espera
+        // también, pero un fallo de push NUNCA debe tumbar el pedido (por
+        // eso va en su propio try/catch independiente del correo).
+        try {
+            const responsePush = await admin.messaging().send({
+                notification: {
+                    title: '¡Nuevo Pedido Recibido! 📦',
+                    body: `${nombreComprador} ha comprado un total de $${totalPedido}.`
+                },
+                data: {
+                    origen: String(orderData.origen || 'web'),
+                    click_action: 'FLUTTER_NOTIFICATION_CLICK'
+                },
+                topic: 'pedidos'
+            });
             addLog(`Push enviado con éxito: ${responsePush}`);
             console.log('Push enviado con éxito:', responsePush);
-        }).catch((errorPush) => {
+        } catch (errorPush) {
             addLog(`ERROR enviando Push: ${errorPush.message}`);
             console.error('Error enviando notificación Push:', errorPush);
-        });
+        }
 
         const overallSuccess = backupSaved || Boolean(stockResultado);
 
@@ -2291,7 +2305,7 @@ app.get('/api/afiliados', async (req, res) => {
             const data = snapshot.val();
             return Array.isArray(data) ? data : (data ? Object.values(data) : []);
         });
-        setPublicCacheHeaders(res, 60, 180);
+        setPublicCacheHeaders(res, 120, 600);
         return res.json({ success: true, afiliados });
     } catch (error) {
         return res.status(500).json({ success: false, message: 'Error al obtener afiliados', error: error.message });
@@ -2305,7 +2319,7 @@ app.get('/api/mensajes', async (req, res) => {
             const data = snapshot.val();
             return Array.isArray(data) ? data : (data ? Object.values(data) : []);
         });
-        setPublicCacheHeaders(res, 60, 180);
+        setPublicCacheHeaders(res, 120, 600);
         return res.json({ success: true, mensajes });
     } catch (error) {
         return res.status(500).json({ success: false, message: 'Error al obtener mensajes', error: error.message });
@@ -2318,7 +2332,7 @@ app.get('/api/evento', async (req, res) => {
             const snapshot = await rtdb.ref('evento').once('value');
             return snapshot.val() || null;
         });
-        setPublicCacheHeaders(res, 60, 180);
+        setPublicCacheHeaders(res, 120, 600);
         return res.json({ success: true, evento: evento || null });
     } catch (error) {
         return res.status(500).json({ success: false, message: 'Error al obtener evento', error: error.message });
@@ -2332,7 +2346,7 @@ app.get('/api/info', async (req, res) => {
             const data = snapshot.val();
             return Array.isArray(data) ? data : (data ? Object.values(data) : []);
         });
-        setPublicCacheHeaders(res, 60, 180);
+        setPublicCacheHeaders(res, 120, 600);
         return res.json({ success: true, info });
     } catch (error) {
         return res.status(500).json({ success: false, message: 'Error al obtener info', error: error.message });
@@ -2378,7 +2392,7 @@ app.get('/api/pay', async (req, res) => {
             const snapshot = await rtdb.ref('pay').once('value');
             return snapshot.val() || null;
         });
-        setPublicCacheHeaders(res, 60, 180);
+        setPublicCacheHeaders(res, 120, 600);
         return res.json({ success: true, pay: pay || null });
     } catch (error) {
         return res.status(500).json({ success: false, message: 'Error al obtener pay', error: error.message });
@@ -2510,7 +2524,7 @@ app.post("/api/clear-statistics", async (req, res) => {
 app.get('/api/products', async (req, res) => {
     try {
         const productMap = await getSecondaryProductMap();
-        setPublicCacheHeaders(res, 30, 120);
+        setPublicCacheHeaders(res, 60, 300);
         return res.json({ success: true, products: Object.values(productMap) });
     } catch (error) {
         return res.status(500).json({ success: false, message: 'Error al obtener productos', error: error.message });
@@ -2526,7 +2540,7 @@ app.get('/api/products/:id', async (req, res) => {
             return res.status(404).json({ success: false, message: 'Producto no encontrado.' });
         }
 
-        setPublicCacheHeaders(res, 30, 120);
+        setPublicCacheHeaders(res, 60, 300);
         return res.json({ success: true, product });
     } catch (error) {
         return res.status(500).json({ success: false, message: 'Error al obtener el producto', error: error.message });
@@ -2677,7 +2691,7 @@ app.delete('/api/products/:id/images/:index', async (req, res) => {
 app.get('/api/packs', async (req, res) => {
     try {
         const packMap = await getPackMap();
-        setPublicCacheHeaders(res, 30, 120);
+        setPublicCacheHeaders(res, 60, 300);
         return res.json({ success: true, packs: Object.values(packMap) });
     } catch (error) {
         return res.status(500).json({ success: false, message: 'Error al obtener packs', error: error.message });
@@ -2838,7 +2852,7 @@ app.get('/api/packs/:id', async (req, res) => {
             return res.status(404).json({ success: false, message: 'Pack no encontrado.' });
         }
 
-        setPublicCacheHeaders(res, 30, 120);
+        setPublicCacheHeaders(res, 60, 300);
         return res.json({ success: true, pack });
     } catch (error) {
         return res.status(500).json({ success: false, message: 'Error al obtener el pack', error: error.message });
